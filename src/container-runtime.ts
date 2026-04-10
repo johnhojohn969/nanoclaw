@@ -112,7 +112,8 @@ export function cleanupOrphans(): void {
       `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
-    const orphans = output.trim().split('\n').filter(Boolean);
+    // Only kill agent containers (nanoclaw-{group}-{timestamp}), not infra containers like nanoclaw-chromadb-1
+    const orphans = output.trim().split('\n').filter((n) => /nanoclaw-.+-\d{13}$/.test(n));
     for (const name of orphans) {
       try {
         stopContainer(name);

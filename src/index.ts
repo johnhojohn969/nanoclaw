@@ -64,6 +64,12 @@ import {
 } from './sender-allowlist.js';
 import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import {
+  buildMemoryContext,
+  initMemory,
+  saveConversationToMemory,
+  saveEvent,
+} from './memory.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -228,7 +234,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  const basePrompt = formatMessages(missedMessages, TIMEZONE);
+
+  // Prepend semantically relevant past context from vector memory (~500 tokens max)
+  const memoryQuery = missedMessages
+    .filter((m) => !m.is_from_me && !m.is_bot_message)
+    .map((m) => m.content)
+    .slice(-3)
+    .join(' ')
+    .slice(0, 600);
+  const memoryBlock = await buildMemoryContext(memoryQuery, group.folder);
+  const prompt = memoryBlock ? `${memoryBlock}${basePrompt}` : basePrompt;
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -307,8 +323,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       { group: group.name },
       'Agent error, rolled back message cursor for retry',
     );
+    // Persist error context to memory so future runs can avoid similar failures
+    saveEvent('agent_error', {
+      groupFolder: group.folder,
+      groupName: group.name,
+      messageCount: missedMessages.length,
+    }).catch(() => {});
     return false;
   }
+
+  // Save processed messages to vector memory for future semantic retrieval
+  saveConversationToMemory(missedMessages, group.folder).catch((err: unknown) =>
+    logger.warn({ err, group: group.name }, 'Memory save failed'),
+  );
 
   return true;
 }
@@ -549,6 +576,7 @@ async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
+  await initMemory();
   loadState();
   restoreRemoteControl();
 
