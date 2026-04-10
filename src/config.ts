@@ -11,9 +11,6 @@ const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
   'TZ',
-  'CHROMA_URL',
-  'MEMORY_ENABLED',
-  'MEMORY_TOP_K',
 ]);
 
 export const ASSISTANT_NAME =
@@ -86,16 +83,6 @@ export function getTriggerPattern(trigger?: string): RegExp {
 }
 
 export const TRIGGER_PATTERN = buildTriggerPattern(DEFAULT_TRIGGER);
-
-// Vector memory (ChromaDB)
-export const CHROMA_URL =
-  process.env.CHROMA_URL || envConfig.CHROMA_URL || 'http://localhost:8000';
-export const MEMORY_ENABLED =
-  (process.env.MEMORY_ENABLED ?? envConfig.MEMORY_ENABLED ?? 'true') !== 'false';
-export const MEMORY_TOP_K = Math.max(
-  1,
-  parseInt(process.env.MEMORY_TOP_K || envConfig.MEMORY_TOP_K || '5', 10) || 5,
-);
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

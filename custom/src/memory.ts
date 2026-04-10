@@ -11,7 +11,12 @@ import path from 'path';
 
 import { ChromaClient, type Collection } from 'chromadb';
 
-import { CHROMA_URL, DATA_DIR, MEMORY_ENABLED, MEMORY_TOP_K } from './config.js';
+import {
+  CHROMA_URL,
+  MEMORY_ENABLED,
+  MEMORY_TOP_K,
+} from './config.custom.js';
+import { DATA_DIR } from './config.js';
 import { logger } from './logger.js';
 import type { NewMessage } from './types.js';
 
@@ -98,12 +103,14 @@ async function tryConnect(): Promise<boolean> {
 function scheduleRetry(): void {
   if (retryTimer) return;
   retryTimer = setInterval(() => {
-    tryConnect().then((ok) => {
-      if (ok && retryTimer) {
-        clearInterval(retryTimer);
-        retryTimer = null;
-      }
-    }).catch(() => undefined);
+    tryConnect()
+      .then((ok) => {
+        if (ok && retryTimer) {
+          clearInterval(retryTimer);
+          retryTimer = null;
+        }
+      })
+      .catch(() => undefined);
   }, 30_000);
 }
 
@@ -268,6 +275,8 @@ export async function buildMemoryContext(
 
   if (relevant.length === 0) return '';
 
-  const entries = relevant.map((r) => `- ${r.document.slice(0, MAX_DOC_CHARS)}`).join('\n');
+  const entries = relevant
+    .map((r) => `- ${r.document.slice(0, MAX_DOC_CHARS)}`)
+    .join('\n');
   return `<memory>\n${entries}\n</memory>\n`;
 }
