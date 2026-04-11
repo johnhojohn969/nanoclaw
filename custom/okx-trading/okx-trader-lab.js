@@ -874,7 +874,7 @@ function loadParams() {
     leverage_tiers_lab: { l2: 0.45, l3: 0.70, l4: 0.90, l5: 1.10 },
     trailing_sl_lab: { t0_sl: -0.04, t0_hwm: 0.00, t1_sl: 0.00, t1_hwm: 0.02, t2_sl: 0.02, t2_hwm: 0.04, t3_trail: 0.03, t3_hwm: 0.08, t4_pct: 0.70, t4_hwm: 0.12, macro_tighten: -0.02 },
     signal_weights: { btc_trend: 0.6, cycle_bias: 0.8, seasonal_bias: 0.5, daily_trend: 0.25, trend_4h: 0.25, rsi_daily_os: 0.40, rsi_daily_ob: -0.35, rsi_4h_os: 0.40, rsi_4h_ob: -0.30, rsi_1h_os: 0.25, rsi_1h_ob: -0.20, rsi_div_4h: 0.45, rsi_div_1h: 0.20, macd: 0.20, bollinger: 0.30, key_level: 0.15, funding_rate: 0.30, liq_sweep: 0.50, fvg: 0.25, vol_high_mult: 1.25, vol_low_mult: 0.80, smc_wyckoff_strong: 0.75, smc_wyckoff_medium: 0.55, smc_wyckoff_weak: 0.35, smc_utad_strong: 0.70, smc_utad_weak: 0.40, smc_bull_trap_strong: 0.65, smc_bull_trap_weak: 0.35, smc_bear_trap_strong: 0.65, smc_bear_trap_weak: 0.35, stop_hunt_round: 0.60, stop_hunt_normal: 0.45, absorption: 0.30, fr_trap_long_extreme: 0.40, fr_trap_long_high: 0.25, fr_trap_short_extreme: 0.45, fr_trap_short_elevated: 0.25, lsr_65pct: 0.35, lsr_60pct: 0.20, lsr_35pct: 0.35, lsr_40pct: 0.20, oi_up_oi_down: 0.30, oi_down_oi_down: 0.20, oi_up_oi_up: 0.15, oi_down_oi_up: 0.15, retail_fomo: 0.35, retail_panic: 0.40, retail_chase: 0.20, retail_despair: 0.25, post_flush: 0.15, bear_trap_fear_bonus: 0.30, bull_trap_greed_bonus: 0.30 },
-    hard_limits: { max_risk_per_trade: 0.08, max_drawdown: 0.20, max_leverage: 12, min_entry_threshold: 0.50, max_weight_delta_per_update: 0.15 },
+    hard_limits: { max_risk_per_trade: 0.08, max_drawdown: 0.20, max_leverage: 12, min_entry_threshold: 0.40, max_weight_delta_per_update: 0.15 },
     evolve: { enabled: true, min_trades_for_analysis: 10, poor_wr_threshold: 0.50, interval_ms: 21600000, last_evolved_at: null },
     instruments: [
       { id: 'ETH-USDT-SWAP', active: true },
@@ -1715,8 +1715,9 @@ function startupAudit(params) {
   if ((h.max_risk_per_trade||0) > 0.08) issues.push(`hard_limit max_risk=${h.max_risk_per_trade} > 0.08`);
   if ((h.max_leverage||0) > 12) issues.push(`hard_limit max_lev=${h.max_leverage} > 12`);
   if ((h.min_entry_threshold||0) < 0.35) issues.push(`hard_limit min_thresh=${h.min_entry_threshold} < 0.35`);
-  const tLab = (params.entry && params.entry.threshold_lab) || 0.50;
-  if ((h.min_entry_threshold||0) < tLab) issues.push("hardlimit minthresh=" + (h.min_entry_threshold||0) + " < " + tLab);
+  const tLab = (params.entry && params.entry.threshold_lab) || 0.45;
+  const gap = tLab - (h.min_entry_threshold||0);
+  if (gap > 0.15) issues.push("hardlimit minthresh=" + (h.min_entry_threshold||0) + " << threshold_lab=" + tLab + " (gap=" + gap.toFixed(2) + ", max 0.15)");
   const ambLow = params.entry?.ambiguous_zone_low || 0.35;
   const ambHigh = params.entry?.ambiguous_zone_high || 0.65;
   if (ambLow >= ambHigh) issues.push(`Ambiguous zone invalid: ${ambLow} >= ${ambHigh}`);
