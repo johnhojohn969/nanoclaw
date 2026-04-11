@@ -41,3 +41,10 @@ src/container-runtime.ts
 .nanoclaw/
 
 agents-sdk-docs
+container/skills/credentials.md
+apply-cron.js
+fix-cron.js
+newcron.txt
+fix-cron2.js
+git-*.js
+host-exec/
