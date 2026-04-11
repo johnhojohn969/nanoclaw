@@ -1,0 +1,2 @@
+*/30 * * * * cd /home/john/workspace/nanoclaw/custom/okx-trading && OKX_STATE_DIR=./okx-state /home/john/.local/bin/node okx-trader.js >> ./logs/trader.log 2>&1
+15,45 * * * * cd /home/john/workspace/nanoclaw/custom/okx-trading && OKX_STATE_DIR=./okx-state /home/john/.local/bin/node okx-trader-lab.js >> ./logs/lab.log 2>&1

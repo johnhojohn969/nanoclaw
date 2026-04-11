@@ -1,15 +1,16 @@
 [Unit]
-Description=NanoClaw ChromaDB Vector Store
+Description=NanoClaw Host Exec Webhook
 After=network.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 WorkingDirectory=/home/john/workspace/nanoclaw
-ExecStart=/usr/bin/docker compose -f docker-compose.chroma.yml up -d
-ExecStop=/usr/bin/docker compose -f docker-compose.chroma.yml down
+ExecStart=/home/john/.local/bin/node host-exec/server.js
 Environment=HOME=/home/john
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/john/.local/bin
+EnvironmentFile=/home/john/workspace/nanoclaw/.env
+Restart=on-failure
+RestartSec=3
 
 [Install]
 WantedBy=default.target

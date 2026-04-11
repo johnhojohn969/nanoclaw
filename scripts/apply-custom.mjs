@@ -1,19 +1,26 @@
 /**
- * Prebuild: copy custom/src/*.ts → src/
- * Files in custom/src/ override or extend upstream src/ files.
- * The copies in src/ are gitignored — source of truth lives in custom/src/.
+ * Prebuild: copy custom overlay files into their target locations.
+ *
+ * Overlays:
+ *   custom/src/*.ts     → src/          (TypeScript overrides)
+ *   custom/host-exec/*  → host-exec/    (host exec webhook server)
+ *
+ * The copies are gitignored — source of truth lives in custom/.
  */
-import { readdirSync, copyFileSync, existsSync } from 'fs';
+import { readdirSync, copyFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 
-const customSrc = 'custom/src';
-const targetSrc = 'src';
-
-if (existsSync(customSrc)) {
-  for (const file of readdirSync(customSrc)) {
-    if (file.endsWith('.ts')) {
-      copyFileSync(join(customSrc, file), join(targetSrc, file));
-      console.log(`apply-custom: ${customSrc}/${file} → ${targetSrc}/${file}`);
-    }
+function copyDir(srcDir, destDir) {
+  if (!existsSync(srcDir)) return;
+  mkdirSync(destDir, { recursive: true });
+  for (const file of readdirSync(srcDir)) {
+    copyFileSync(join(srcDir, file), join(destDir, file));
+    console.log(`apply-custom: ${srcDir}/${file} → ${destDir}/${file}`);
   }
 }
+
+// TypeScript source overrides
+copyDir('custom/src', 'src');
+
+// Host exec webhook server
+copyDir('custom/host-exec', 'host-exec');

@@ -1,0 +1,18 @@
+services:
+  chromadb:
+    image: chromadb/chroma:0.5.23
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/chroma:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
