@@ -1,0 +1,9 @@
+.env
+okx-state/journal.jsonl
+okx-state/okx-lab-journal.jsonl
+okx-state/okx-trader-state.json
+okx-state/okx-lab-state.json
+okx-state/performance.json
+logs/
+*.log
+
