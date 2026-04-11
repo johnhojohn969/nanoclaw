@@ -1683,7 +1683,10 @@ function startupAudit(params) {
   const h = params.hard_limits || {};
   if ((h.max_risk_per_trade||0) > 0.08) issues.push(`hard_limit max_risk=${h.max_risk_per_trade} > 0.08`);
   if ((h.max_leverage||0) > 12) issues.push(`hard_limit max_lev=${h.max_leverage} > 12`);
-  if ((h.min_entry_threshold||0) < 0.55) issues.push(`hard_limit min_thresh=${h.min_entry_threshold} < 0.55`);
+    if ((h.min_entry_threshold||0) < 0.35) issues.push("hard_limit min_thresh=" + (h.min_entry_threshold||0) + " < 0.35 (absolute floor)");
+  var tM = (params.entry && params.entry.threshold_main) || 0.75;
+  var gM = tM - (h.min_entry_threshold || 0);
+  if (gM > 0.25) issues.push("hardlimit minthresh=" + (h.min_entry_threshold||0) + " << threshold_main=" + tM + " (gap=" + gM.toFixed(2) + ", max 0.25)");
   const ambLow = params.entry?.ambiguous_zone_low || 0.60;
   const ambHigh = params.entry?.ambiguous_zone_high || 0.90;
   if (ambLow >= ambHigh) issues.push(`Ambiguous zone invalid: ${ambLow} >= ${ambHigh}`);
@@ -1932,6 +1935,7 @@ if (true) {
         }
       }
       if (sig.confidence === 'low' || sig.confidence === 'none') continue;
+      if (!sig.direction) continue; // direction null after ambiguous zone check
     }
     // ── Re-entry cooldown: block re-entry after SL hit ──────────────────────
     const lastSlData = state.lastSL?.[instId];
