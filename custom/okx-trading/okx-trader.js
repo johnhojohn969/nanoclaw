@@ -157,58 +157,13 @@ function pickOiPrev(state, instId) {
   return oldestAge >= 3600 * 1000 ? oldest.oi : null;
 }
 
-// ── Exchange-side SL algo sync (Fix #3 + 3b) ─────────────────────────────────
-// Keeps a conditional SL order on the exchange in sync with the local tiered
-// trailing SL. Uses amend-algos when a client-order id is known; falls back to
-// cancel-then-recreate via orders-algo-pending discovery.
-async function syncExchangeSl(instId, dir, newSlTriggerPx, openDataEntry) {
-  const triggerPx = formatPx(newSlTriggerPx);
-  if (!triggerPx) throw new Error('invalid trigger px');
-  const posSide = (dir === 'LONG' || dir === 'long') ? 'long' : 'short';
-  const closeSide = posSide === 'long' ? 'sell' : 'buy';
-  const knownClId = openDataEntry?.slAlgoClOrdId || null;
-
-  // Try amend first (atomic, doesn't briefly leave position unprotected)
-  if (knownClId) {
-    const amend = await apiPost('/api/v5/trade/amend-algos', [{
-      instId,
-      algoClOrdId: knownClId,
-      newSlTriggerPx: triggerPx,
-      newSlOrdPx: '-1',
-    }]).catch(e => ({ code: 'err', err: e.message }));
-    if (amend?.code === '0') return { mode: 'amend', clId: knownClId };
-  }
-
-  // Discover existing pending conditional algos for this instId/posSide
-  const pending = await apiGet(`/api/v5/trade/orders-algo-pending?ordType=conditional&instId=${instId}`)
-    .catch(() => null);
-  const live = (pending?.data || []).filter(a => a.posSide === posSide && a.slTriggerPx);
-  // Cancel live SL algos for this posSide
-  if (live.length) {
-    const cancelBody = live.map(a => ({ instId, algoId: a.algoId }));
-    await apiPost('/api/v5/trade/cancel-algos', cancelBody).catch(() => null);
-  }
-  // Post a fresh conditional SL algo
-  const clId = `sl${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}${Date.now().toString().slice(-10)}`.slice(0, 32);
-  const posResp = await apiGet(`/api/v5/account/positions?instId=${instId}`).catch(() => null);
-  const live2 = (posResp?.data || []).find(p => p.posSide === posSide && Math.abs(parseFloat(p.pos)) > 0);
-  const sz = live2 ? Math.abs(parseFloat(live2.pos)) : null;
-  if (!sz) throw new Error('no open position for SL');
-  const post = await apiPost('/api/v5/trade/order-algo', {
-    instId, tdMode: 'cross',
-    side: closeSide, posSide,
-    ordType: 'conditional',
-    sz: String(sz),
-    slTriggerPx: triggerPx,
-    slOrdPx: '-1',
-    slTriggerPxType: 'last',
-    algoClOrdId: clId,
-    reduceOnly: 'true',
-  });
-  if (post?.code !== '0') throw new Error(`order-algo failed: ${post?.data?.[0]?.sMsg || JSON.stringify(post).slice(0,120)}`);
-  if (openDataEntry) openDataEntry.slAlgoClOrdId = clId;
-  return { mode: 'recreate', clId };
-}
+// [removed] syncExchangeSl — superseded by ensureProfitLockSl (below).
+// Amend-algos against an attached conditional (from attachAlgoOrds) was
+// not reliably modifying the SL in practice: OKX reported code 0 but the
+// SL trigger on the attached algo stayed at its original value, so the
+// hold-loop kept "thinking" it was syncing while nothing actually changed.
+// ensureProfitLockSl uses a SEPARATE standalone conditional algo for the
+// profit lock, leaving the attached hard SL/TP untouched as a floor.
 
 // ── OKX native trailing stop (move_order_stop) ───────────────────────────────
 // Runs server-side at tick speed so profit-locking trails between cron cycles.
@@ -242,6 +197,80 @@ async function placeTrailingStop(instId, direction, entryPrice, atr, atrPct, sz)
     .catch(e => ({ code: 'err', err: e.message }));
   if (r?.code === '0') return { clId, callbackRatio, activePx };
   throw new Error(`trailing stop failed: ${r?.data?.[0]?.sMsg || r?.err || JSON.stringify(r).slice(0, 120)}`);
+}
+
+// ── Profit lock SL (standalone conditional algo, separate from hard SL) ──
+// The original attached SL from entry (via attachAlgoOrds) is the hard floor
+// that protects against liquidation; we intentionally never touch it because
+// amend-algos on an attached algo is unreliable. Instead, once the position
+// is meaningfully in profit we place a SEPARATE standalone conditional SL
+// that acts as a "profit lock" and progressively tightens through tiers
+// (breakeven → +5% → +10% → trailing 70% of HWM).
+//
+// Semantics for the user: on the OKX algo panel they will see
+//   attached TPYSL  (2340.84 / 2418.12)   ← floor from entry, never changes
+//   DCDL trailing   (move_order_stop)     ← tick-level continuous trail
+//   pl… TPYSL       (2392.00 / –)         ← profit lock, updated per tier
+// Whichever fires first closes the position; others auto-cancel when pos=0.
+async function ensureProfitLockSl(instId, dir, newLockPrice, openDataEntry) {
+  const triggerPx = formatPx(newLockPrice);
+  if (!triggerPx) throw new Error('invalid profit lock trigger px');
+  const posSide = (dir === 'LONG' || dir === 'long') ? 'long' : 'short';
+  const closeSide = posSide === 'long' ? 'sell' : 'buy';
+  const existingClId = openDataEntry?.profitLockClOrdId || null;
+  const prevLockPrice = openDataEntry?.profitLockLevelPrice || null;
+
+  // Skip if the price barely moved (avoid thrashing the exchange on noise)
+  if (existingClId && prevLockPrice &&
+      Math.abs(newLockPrice - prevLockPrice) / prevLockPrice < 0.0005) {
+    return { mode: 'noop' };
+  }
+
+  // Try amend first (atomic — no momentary gap in protection)
+  if (existingClId) {
+    const amend = await apiPost('/api/v5/trade/amend-algos', [{
+      instId,
+      algoClOrdId: existingClId,
+      newSlTriggerPx: triggerPx,
+      newSlOrdPx: '-1',
+    }]).catch(e => ({ code: 'err', err: e.message }));
+    if (amend?.code === '0') {
+      openDataEntry.profitLockLevelPrice = newLockPrice;
+      return { mode: 'amend', clId: existingClId };
+    }
+    // Amend failed — cancel the stale one before re-posting
+    await apiPost('/api/v5/trade/cancel-algos', [{
+      instId, algoClOrdId: existingClId,
+    }]).catch(() => null);
+    openDataEntry.profitLockClOrdId = null;
+  }
+
+  // Need actual position size for reduceOnly
+  const posResp = await apiGet(`/api/v5/account/positions?instId=${instId}`)
+    .catch(() => null);
+  const live = (posResp?.data || []).find(p =>
+    p.posSide === posSide && Math.abs(parseFloat(p.pos)) > 0);
+  const sz = live ? Math.abs(parseFloat(live.pos)) : null;
+  if (!sz) throw new Error('no open position for profit lock');
+
+  const newClId = `pl${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+  const post = await apiPost('/api/v5/trade/order-algo', {
+    instId, tdMode: 'cross',
+    side: closeSide, posSide,
+    ordType: 'conditional',
+    sz: String(sz),
+    slTriggerPx: triggerPx,
+    slOrdPx: '-1',
+    slTriggerPxType: 'last',
+    algoClOrdId: newClId,
+    reduceOnly: 'true',
+  });
+  if (post?.code !== '0') {
+    throw new Error(`profit lock post failed: ${post?.data?.[0]?.sMsg || JSON.stringify(post).slice(0, 120)}`);
+  }
+  openDataEntry.profitLockClOrdId = newClId;
+  openDataEntry.profitLockLevelPrice = newLockPrice;
+  return { mode: 'created', clId: newClId };
 }
 
 // ── Macro Check ───────────────────────────────────────────────────────────────
@@ -2159,27 +2188,36 @@ for (const pos of openPos) {
   pushOiSample(state, instId, m.oiCurrent);
   const sig = generateSignal(m, cycle, fg, null, btcTrend, params);
 
-  // ── Sync exchange-side SL algo when tier advances (Fix #3b) ──────────────
-  const newSlPrice = ladderSlToPrice(entryPrice, slThreshold, lever, dir);
-  const prevExSl = state.openData?.[instId]?.currentExchangeSlPrice || null;
-  let exchangeSlOk = prevExSl != null;
-  // Only amend when trigger moves meaningfully (>0.1% of entry) to avoid thrash
-  if (newSlPrice && (!prevExSl || Math.abs(newSlPrice - prevExSl) / entryPrice > 0.001)) {
-    try {
-      await syncExchangeSl(instId, dir, newSlPrice, state.openData?.[instId]);
-      if (!state.openData[instId]) state.openData[instId] = {};
-      state.openData[instId].currentExchangeSlPrice = newSlPrice;
-      exchangeSlOk = true;
-      console.log(`  ExchangeSL synced → ${formatPx(newSlPrice)} (${slLabel})`);
-    } catch (e) {
-      exchangeSlOk = false;
-      console.log(`  [WARN] Exchange SL sync failed: ${e.message}`);
-      cycleAlerts.push({
-        level: 'critical', icon: '❌',
-        text: `Exchange SL sync failed: <b>${htmlEscape(instId.split('-')[0])}</b> ${htmlEscape(e.message.slice(0,60))}`,
-      });
+  // ── Profit-lock SL (standalone algo, kicks in at hwm ≥ t1 threshold) ─
+  // Only touch this once position is actually in profit territory. The
+  // original hard SL from entry (2392 + 1.5·ATR zone) and the OKX trailing
+  // stop are independent — we never modify those. This adds a third
+  // explicit "profit lock" conditional that's visible in the OKX algo
+  // panel with clear semantics for the user.
+  const newLockPrice = ladderSlToPrice(entryPrice, slThreshold, lever, dir);
+  const prevLockPrice = state.openData?.[instId]?.profitLockLevelPrice || null;
+  let profitLockStatus = null;
+  // Only place/update the profit lock if the effective lock is ≥ 0 on the
+  // margin side (i.e. at least breakeven — don't duplicate the hard SL at
+  // a loss level). slThreshold ≥ 0 corresponds to tiers t2..t5.
+  if (newLockPrice && slThreshold >= 0 && hwm >= (tsl.t2_hwm || 0.10)) {
+    if (!prevLockPrice || Math.abs(newLockPrice - prevLockPrice) / entryPrice > 0.001) {
+      try {
+        if (!state.openData[instId]) state.openData[instId] = {};
+        const res = await ensureProfitLockSl(instId, dir, newLockPrice, state.openData[instId]);
+        profitLockStatus = res.mode;
+        console.log(`  ProfitLock ${res.mode} → ${formatPx(newLockPrice)} (${slLabel})`);
+      } catch (e) {
+        console.log(`  [WARN] ProfitLock failed: ${e.message}`);
+        cycleAlerts.push({
+          level: 'warning', icon: '⚠️',
+          text: `Profit-lock SL failed: <b>${htmlEscape(instId.split('-')[0])}</b> ${htmlEscape(e.message.slice(0,60))}`,
+        });
+      }
     }
   }
+  const exchangeSlOk = state.openData?.[instId]?.profitLockClOrdId != null
+    || state.openData?.[instId]?.slAlgoClOrdId != null;
 
   // Log SMC signals for open positions (trap warnings critical)
   const posSmcLog = [
@@ -2195,8 +2233,8 @@ for (const pos of openPos) {
   const od = state.openData?.[instId] || {};
   const tsOpenMs = od.ts_open ? new Date(od.ts_open).getTime() : null;
   const ageMs = tsOpenMs ? (Date.now() - tsOpenMs) : null;
-  // SL in absolute price: prefer stored currentExchangeSlPrice, else compute
-  const slPriceAbs = (od.currentExchangeSlPrice || newSlPrice);
+  // SL in absolute price: prefer profit lock (tightest), else ATR hard SL
+  const slPriceAbs = od.profitLockLevelPrice || od.atrSlPrice || newLockPrice;
   // Distance from current price to SL, as % of current price (signed: always +)
   let distToSlPct = null;
   if (slPriceAbs && m.price) {
@@ -2664,11 +2702,12 @@ if (true) {
         btc_bias: btcTrend?.bias || null, fear_greed: fg.value, funding_rate: m?.fr || null,
         claude_reasoning: state.openData?.[instId]?.claude_reasoning || null,
         score_breakdown: sig.scoreBreakdown || null,
-        atrSlPrice: slPrice,
-        atrTpPrice: tpPrice,
+        atrSlPrice: slPrice,                      // hard floor SL (attachAlgoOrds)
+        atrTpPrice: tpPrice,                      // hard TP ceiling
         atrSlUplRatio,                            // signed, for t0 tier override
-        currentExchangeSlPrice: slPrice,          // tracks live exchange SL
-        slAlgoClOrdId: slClOrdId,                 // for amend-algos
+        slAlgoClOrdId: slClOrdId,                 // attached hard SL client id
+        profitLockClOrdId: null,                  // set by ensureProfitLockSl when hwm ≥ t2
+        profitLockLevelPrice: null,               // current profit lock level (tier ladder)
         trailAlgoClOrdId: trailInfo?.clId || null,
         trailCallbackRatio: trailInfo?.callbackRatio || null,
         trailActivePx: trailInfo?.activePx || null,
