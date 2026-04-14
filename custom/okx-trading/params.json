@@ -1,0 +1,161 @@
+{
+  "version": 0,
+  "update_reason": "defaults",
+  "risk": {
+    "risk_per_trade_main": 0.08,
+    "max_positions_main": 2,
+    "max_drawdown_main": 0.2,
+    "max_leverage_main": 12,
+    "reentry_cooldown_ms": 14400000
+  },
+  "entry": {
+    "threshold_main": 0.75,
+    "ambiguous_zone_low": 0.6,
+    "ambiguous_zone_high": 0.9,
+    "tp_main": 0.2,
+    "initial_sl_main": -0.07,
+    "threshold_lab": 0.55
+  },
+  "leverage_tiers_main": {
+    "l3": 0.75,
+    "l5": 0.9,
+    "l8": 1.1,
+    "l12": 1.4
+  },
+  "trailing_sl_main": {
+    "t0_sl": -0.07,
+    "t0_hwm": 0,
+    "t1_sl": -0.04,
+    "t1_hwm": 0.03,
+    "t2_sl": 0,
+    "t2_hwm": 0.05,
+    "t3_sl": 0.03,
+    "t3_hwm": 0.08,
+    "t4_trail": 0.05,
+    "t4_hwm": 0.12,
+    "t5_pct": 0.65,
+    "t5_hwm": 0.18,
+    "macro_tighten": -0.04
+  },
+  "signal_weights": {
+    "btc_trend": 0.6,
+    "cycle_bias": 0.8,
+    "seasonal_bias": 0.5,
+    "daily_trend": 0.25,
+    "trend_4h": 0.25,
+    "rsi_daily_os": 0.4,
+    "rsi_daily_ob": -0.35,
+    "rsi_4h_os": 0.4,
+    "rsi_4h_ob": -0.3,
+    "rsi_1h_os": 0.25,
+    "rsi_1h_ob": -0.2,
+    "rsi_div_4h": 0.45,
+    "rsi_div_1h": 0.2,
+    "macd": 0.2,
+    "bollinger": 0.3,
+    "key_level": 0.15,
+    "funding_rate": 0.3,
+    "liq_sweep": 0.5,
+    "fvg": 0.25,
+    "vol_high_mult": 1.25,
+    "vol_low_mult": 0.8,
+    "smc_wyckoff_strong": 0.75,
+    "smc_wyckoff_medium": 0.55,
+    "smc_wyckoff_weak": 0.35,
+    "smc_utad_strong": 0.7,
+    "smc_utad_weak": 0.4,
+    "smc_bull_trap_strong": 0.65,
+    "smc_bull_trap_weak": 0.35,
+    "smc_bear_trap_strong": 0.65,
+    "smc_bear_trap_weak": 0.35,
+    "stop_hunt_round": 0.6,
+    "stop_hunt_normal": 0.45,
+    "absorption": 0.3,
+    "fr_trap_long_extreme": 0.4,
+    "fr_trap_long_high": 0.25,
+    "fr_trap_short_extreme": 0.45,
+    "fr_trap_short_elevated": 0.25,
+    "lsr_65pct": 0.35,
+    "lsr_60pct": 0.2,
+    "lsr_35pct": 0.35,
+    "lsr_40pct": 0.2,
+    "oi_up_oi_down": 0.3,
+    "oi_down_oi_down": 0.2,
+    "oi_up_oi_up": 0.15,
+    "oi_down_oi_up": 0.15,
+    "retail_fomo": 0.35,
+    "retail_panic": 0.4,
+    "retail_chase": 0.2,
+    "retail_despair": 0.25,
+    "post_flush": 0.15,
+    "bear_trap_fear_bonus": 0.3,
+    "bull_trap_greed_bonus": 0.3
+  },
+  "hard_limits": {
+    "max_risk_per_trade": 0.08,
+    "max_drawdown": 0.2,
+    "max_leverage": 12,
+    "min_entry_threshold": 0.55,
+    "max_weight_delta_per_update": 0.15
+  },
+  "evolve": {
+    "enabled": true,
+    "min_trades_for_analysis": 10,
+    "poor_wr_threshold": 0.5,
+    "interval_ms": 21600000,
+    "last_evolved_at": null
+  },
+  "instruments": [
+    {
+      "id": "ETH-USDT-SWAP",
+      "active": true
+    },
+    {
+      "id": "SOL-USDT-SWAP",
+      "active": true
+    },
+    {
+      "id": "AVAX-USDT-SWAP",
+      "active": true
+    }
+  ],
+  "session_rules": {
+    "asian": {
+      "max_leverage": 8,
+      "size_multiplier": 0.8
+    },
+    "london": {
+      "max_leverage": 12,
+      "size_multiplier": 1
+    },
+    "ny": {
+      "max_leverage": 10,
+      "size_multiplier": 0.9
+    }
+  },
+  "ai": {
+    "model_tier": {
+      "fast": "cheapest",
+      "smart": "best_non_opus"
+    },
+    "model_resolved": {
+      "fast": "claude-haiku-4-5-20251001",
+      "smart": "claude-sonnet-4-6",
+      "resolved_at": "2026-04-11T00:15:30.996Z"
+    },
+    "model_overrides": {
+      "fast": null,
+      "smart": null
+    }
+  },
+  "sanity": {
+    "check_interval_ms": 86400000,
+    "last_checked_at": "2026-04-11T00:15:33.114Z",
+    "alert_thresholds": {
+      "wr_floor_20trades": 0.35,
+      "consecutive_sl": 4,
+      "version_bumps_per_day": 3,
+      "journal_gap_hours": 2
+    }
+  }
+}

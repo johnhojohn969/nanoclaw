@@ -1,0 +1,16 @@
+[Unit]
+Description=NanoClaw Host Exec Webhook
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/john/workspace/nanoclaw
+ExecStart=/home/john/.local/bin/node host-exec/server.js
+Environment=HOME=/home/john
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/john/.local/bin
+EnvironmentFile=/home/john/workspace/nanoclaw/.env
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
