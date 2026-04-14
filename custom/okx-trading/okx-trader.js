@@ -123,9 +123,92 @@ async function getFearGreed() {
 // ── State ─────────────────────────────────────────────────────────────────────
 function loadState() {
   try { if (existsSync(STATE_FILE)) return JSON.parse(readFileSync(STATE_FILE, 'utf-8')); } catch {}
-  return { peakEquity: 100, trades: [], log: [], lastTrade: {}, trailPeak: {}, lastSL: {} };
+  return { peakEquity: 100, trades: [], log: [], lastTrade: {}, trailPeak: {}, lastSL: {}, oiHistory: {} };
 }
 function saveState(s) { try { writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch {} }
+
+// ── OI history cache (for real OI divergence analysis) ───────────────────────
+// We sample OI per instrument each cycle and pick a ~2–8h-old sample as the
+// "previous" reference point. OKX has no public historical OI-per-instrument
+// endpoint, so we roll our own cache in the state file.
+function pushOiSample(state, instId, oiValue) {
+  if (!oiValue || !isFinite(oiValue)) return;
+  if (!state.oiHistory) state.oiHistory = {};
+  const rec = state.oiHistory[instId] || { samples: [] };
+  rec.samples = (rec.samples || []).filter(s => s && s.ts && s.oi);
+  rec.samples.push({ ts: new Date().toISOString(), oi: oiValue });
+  // keep last 24 samples (~12h at 30-min cadence)
+  if (rec.samples.length > 24) rec.samples = rec.samples.slice(-24);
+  state.oiHistory[instId] = rec;
+}
+function pickOiPrev(state, instId) {
+  const rec = state.oiHistory?.[instId];
+  if (!rec?.samples?.length) return null;
+  const now = Date.now();
+  // Prefer the oldest sample still inside the [2h, 8h] window
+  const candidates = rec.samples.filter(s => {
+    const age = now - new Date(s.ts).getTime();
+    return age >= 2 * 3600 * 1000 && age <= 8 * 3600 * 1000;
+  });
+  if (candidates.length) return candidates[0].oi;
+  // Fallback: the oldest available sample if at least 1h old
+  const oldest = rec.samples[0];
+  const oldestAge = now - new Date(oldest.ts).getTime();
+  return oldestAge >= 3600 * 1000 ? oldest.oi : null;
+}
+
+// ── Exchange-side SL algo sync (Fix #3 + 3b) ─────────────────────────────────
+// Keeps a conditional SL order on the exchange in sync with the local tiered
+// trailing SL. Uses amend-algos when a client-order id is known; falls back to
+// cancel-then-recreate via orders-algo-pending discovery.
+async function syncExchangeSl(instId, dir, newSlTriggerPx, openDataEntry) {
+  const triggerPx = formatPx(newSlTriggerPx);
+  if (!triggerPx) throw new Error('invalid trigger px');
+  const posSide = (dir === 'LONG' || dir === 'long') ? 'long' : 'short';
+  const closeSide = posSide === 'long' ? 'sell' : 'buy';
+  const knownClId = openDataEntry?.slAlgoClOrdId || null;
+
+  // Try amend first (atomic, doesn't briefly leave position unprotected)
+  if (knownClId) {
+    const amend = await apiPost('/api/v5/trade/amend-algos', [{
+      instId,
+      algoClOrdId: knownClId,
+      newSlTriggerPx: triggerPx,
+      newSlOrdPx: '-1',
+    }]).catch(e => ({ code: 'err', err: e.message }));
+    if (amend?.code === '0') return { mode: 'amend', clId: knownClId };
+  }
+
+  // Discover existing pending conditional algos for this instId/posSide
+  const pending = await apiGet(`/api/v5/trade/orders-algo-pending?ordType=conditional&instId=${instId}`)
+    .catch(() => null);
+  const live = (pending?.data || []).filter(a => a.posSide === posSide && a.slTriggerPx);
+  // Cancel live SL algos for this posSide
+  if (live.length) {
+    const cancelBody = live.map(a => ({ instId, algoId: a.algoId }));
+    await apiPost('/api/v5/trade/cancel-algos', cancelBody).catch(() => null);
+  }
+  // Post a fresh conditional SL algo
+  const clId = `sl${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+  const posResp = await apiGet(`/api/v5/account/positions?instId=${instId}`).catch(() => null);
+  const live2 = (posResp?.data || []).find(p => p.posSide === posSide && Math.abs(parseFloat(p.pos)) > 0);
+  const sz = live2 ? Math.abs(parseFloat(live2.pos)) : null;
+  if (!sz) throw new Error('no open position for SL');
+  const post = await apiPost('/api/v5/trade/order-algo', {
+    instId, tdMode: 'cross',
+    side: closeSide, posSide,
+    ordType: 'conditional',
+    sz: String(sz),
+    slTriggerPx: triggerPx,
+    slOrdPx: '-1',
+    slTriggerPxType: 'last',
+    algoClOrdId: clId,
+    reduceOnly: 'true',
+  });
+  if (post?.code !== '0') throw new Error(`order-algo failed: ${post?.data?.[0]?.sMsg || JSON.stringify(post).slice(0,120)}`);
+  if (openDataEntry) openDataEntry.slAlgoClOrdId = clId;
+  return { mode: 'recreate', clId };
+}
 
 // ── Macro Check ───────────────────────────────────────────────────────────────
 function getMacroRestriction() {
@@ -226,6 +309,81 @@ function rsiDiv(closes, n=14, lb=20) {
   if (Math.min(...ps.slice(h))<Math.min(...ps.slice(0,h))*0.998 && Math.min(...rs.slice(h))>Math.min(...rs.slice(0,h))*1.02) return 'bullish';
   if (Math.max(...ps.slice(h))>Math.max(...ps.slice(0,h))*1.002 && Math.max(...rs.slice(h))<Math.max(...rs.slice(0,h))*0.98) return 'bearish';
   return 'none';
+}
+
+// ── ATR (Average True Range) ──────────────────────────────────────────────────
+// Input: raw OKX candles (newest-first) in format [ts, o, h, l, c, vol, volCcy, ...]
+// Output: ATR over `n` bars in underlying price units
+function atr(rawCandles, n = 14) {
+  if (!rawCandles || rawCandles.length < n + 1) return null;
+  const c = rawCandles.slice(0, n + 1).reverse(); // chronological
+  let sum = 0;
+  for (let i = 1; i < c.length; i++) {
+    const high = parseFloat(c[i][2]);
+    const low  = parseFloat(c[i][3]);
+    const prev = parseFloat(c[i - 1][4]);
+    const tr = Math.max(high - low, Math.abs(high - prev), Math.abs(low - prev));
+    sum += tr;
+  }
+  return sum / (c.length - 1);
+}
+
+// ── Universal instrument profile ──────────────────────────────────────────────
+// Volatility-normalized (ATR) + liquidity-aware scaling.
+// Same formula for every coin — no per-coin tuning needed.
+function getInstrumentProfile(c1hRaw, tickerRow, price, maxLevCap) {
+  const atr1h = atr(c1hRaw, 14);
+  if (!atr1h || !isFinite(atr1h) || !price) return null;
+  const atrPct = atr1h / price;
+  // 24h USD turnover: OKX SWAP `volCcy24h` is in base-ccy (e.g. ETH), multiply by price
+  const volUsd = parseFloat(tickerRow?.volCcy24h || 0) * price;
+  // Liquidity score: log-normalized. $10M → 0.0, $1B → 1.0
+  const liquidityScore = Math.min(1, Math.max(0, (Math.log10(Math.max(volUsd, 1e6)) - 7) / 2));
+  // Size multiplier: illiquid coins get smaller positions (0.4 – 1.0)
+  const sizeMult = 0.4 + 0.6 * liquidityScore;
+  // Volatility-adjusted leverage cap.
+  // Rationale: target ~12% margin heat per 1-ATR underlying move.
+  //   maxLev ≈ 0.12 / atrPct  (e.g. atrPct=2% → 6x, atrPct=4% → 3x)
+  const maxLevFromVol = Math.max(3, Math.round(0.12 / Math.max(atrPct, 0.005)));
+  const maxLev = Math.min(maxLevCap, maxLevFromVol);
+  return {
+    atr: atr1h,
+    atrPct,
+    volUsd,
+    liquidityScore,
+    sizeMult,
+    maxLev,
+    k_sl: 1.5,  // SL distance = 1.5 × ATR from entry
+    k_tp: 3.0,  // TP distance = 3.0 × ATR from entry (1:2 R:R)
+  };
+}
+
+// ── Trading session (UTC) ─────────────────────────────────────────────────────
+function getCurrentSession() {
+  const hour = new Date().getUTCHours();
+  if (hour < 8)  return 'asian';
+  if (hour < 13) return 'london';
+  return 'ny';
+}
+
+// ── Convert trailing-ladder SL (uplRatio scale) to trigger price ─────────────
+// uplRatio = PnL / margin = (price_change / entry) × leverage × sign(direction)
+// So: price_change / entry = slUplRatio / leverage
+function ladderSlToPrice(entryPrice, slUplRatio, leverage, direction) {
+  if (!entryPrice || !leverage) return null;
+  const pctFromEntry = slUplRatio / leverage; // signed
+  const isLong = direction === 'long' || direction === 'LONG';
+  return isLong
+    ? entryPrice * (1 + pctFromEntry)
+    : entryPrice * (1 - pctFromEntry);
+}
+
+// ── OKX price precision helper ────────────────────────────────────────────────
+// OKX accepts plain decimal price strings; use 6 significant digits to stay
+// well inside tick-size tolerance for the watchlist instruments.
+function formatPx(p) {
+  if (p == null || !isFinite(p)) return null;
+  return Number(p).toPrecision(6);
 }
 
 function detectLiqSweep(c4h, lookback=10) {
@@ -795,7 +953,10 @@ function analyzeOIDivergence(oiCurrent, oiPrev, priceChange) {
 // ════════════════════════════════════════════════════════════════════════════
 
 // ── Full Market Analysis ──────────────────────────────────────────────────────
-async function analyzeMarket(instId) {
+// fg:      current Fear&Greed object (for FR-trap fusion)
+// oiPrev:  previous OI sample from state cache (for OI divergence)
+// maxLev:  hard leverage cap (from params) for instrument profile
+async function analyzeMarket(instId, fg = { value: 50 }, oiPrev = null, maxLev = 12) {
   const [c1h, c4h, c1d, tick, fund, oi, lsr] = await Promise.all([
     apiGet(`/api/v5/market/candles?instId=${instId}&bar=1H&limit=150`),
     apiGet(`/api/v5/market/candles?instId=${instId}&bar=4H&limit=100`),
@@ -812,13 +973,13 @@ async function analyzeMarket(instId) {
   const cd  = c1d.data.map(c=>parseFloat(c[4])).reverse();
   const v1  = c1h.data.map(c=>parseFloat(c[5])).reverse();
 
-  const price = parseFloat(tick.data?.[0]?.last || c1.at(-1));
+  const tickerRow = tick.data?.[0] || null;
+  const price = parseFloat(tickerRow?.last || c1.at(-1));
   const fr    = parseFloat(fund.data?.[0]?.fundingRate||0)*100;
 
-  // OI data (for divergence analysis)
+  // OI data — oiPrev now supplied by caller from state cache (real divergence)
   const oiCurrent = oi.data?.[0] ? parseFloat(oi.data[0].oi) : null;
-  const oiPrev    = null; // would need historical OI — use ticker 24h change as proxy
-  const priceChg24h = tick.data?.[0] ? (parseFloat(tick.data[0].last) - parseFloat(tick.data[0].open24h)) / parseFloat(tick.data[0].open24h) : 0;
+  const priceChg24h = tickerRow ? (parseFloat(tickerRow.last) - parseFloat(tickerRow.open24h)) / parseFloat(tickerRow.open24h) : 0;
 
   // Long/Short ratio
   const lsrData   = lsr.data?.[0] ? parseFloat(lsr.data[0].longShortRatio) : null;
@@ -846,6 +1007,9 @@ async function analyzeMarket(instId) {
   const fundLong=fr>0.08, fundShort=fr<-0.05;
   const nearHigh=price>h20*0.98, nearLow=price<l20*1.02;
 
+  // ── Universal instrument profile (ATR volatility + liquidity normalized) ──
+  const profile = getInstrumentProfile(c1h.data, tickerRow, price, maxLev);
+
   // ── Smart Money Signals ────────────────────────────────────────────────────
   // Pass raw OHLCV candle arrays (newest first from OKX)
   const c4raw = c4h.data;  // OKX returns newest first
@@ -856,9 +1020,9 @@ async function analyzeMarket(instId) {
     utad:        detectUTAD(c4raw, rsi4rolling),
     stopHunt:    detectStopHunt(c4raw, price),
     absorption:  detectAbsorption(c4raw),
-    fundingTrap: analyzeFundingTrap(fr, price, {value: 50}), // fg injected later in signal
+    fundingTrap: analyzeFundingTrap(fr, price, fg),            // FIX: real F&G
     lsr:         analyzeLSRatio(lsrLongPct),
-    oiDiv:       analyzeOIDivergence(oiCurrent, oiCurrent, priceChg24h), // simplified
+    oiDiv:       analyzeOIDivergence(oiCurrent, oiPrev, priceChg24h), // FIX: real oiPrev
   };
 
   return {
@@ -869,6 +1033,7 @@ async function analyzeMarket(instId) {
     trend4h: bullTrend?'BULL':bearTrend?'BEAR':'MIXED',
     smc, oiCurrent, lsrLongPct, priceChg24h,
     rsi4rolling,
+    profile, // ATR, sizeMult, maxLev, k_sl, k_tp, liquidityScore, volUsd, atrPct
   };
 }
 
@@ -1778,13 +1943,17 @@ for (const pos of openPos) {
   // ── Tiered SL threshold (tightens as position profits) — uses params ─────
   const tsl = params?.trailing_sl_main || {};
   let slThreshold, slLabel;
+  // ATR-based initial SL override — if we stored one at entry, use it at t0
+  // so the initial stop scales with the coin's natural volatility (universal).
+  const od0 = state.openData?.[instId] || {};
+  const atrT0Sl = typeof od0.atrSlUplRatio === 'number' ? od0.atrSlUplRatio : null;
   // Tiered SL — thresholds in position-margin % (pos.uplRatio scale)
   // t5: hwm≥30% → trail at 70% of hwm
   // t4: hwm≥20% → HARD LOCK at +10%
   // t3: hwm≥15% → HARD LOCK at +5%
   // t2: hwm≥10% → break-even
   // t1: hwm≥5%  → tighten SL to -3%
-  // t0: default  → initial SL -7%
+  // t0: default  → ATR-scaled initial SL (or fallback -7%)
   if (hwm >= (tsl.t5_hwm || 0.30)) {
     slThreshold = hwm * (tsl.t5_pct || 0.70);
     slLabel = `Trail${((tsl.t5_pct||0.70)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%→SL:${(slThreshold*100).toFixed(0)}%)`;
@@ -1800,6 +1969,9 @@ for (const pos of openPos) {
   } else if (hwm >= (tsl.t1_hwm || 0.05)) {
     slThreshold = tsl.t1_sl || -0.03;
     slLabel = `Tight${((tsl.t1_sl||-0.03)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%)`;
+  } else if (atrT0Sl != null) {
+    slThreshold = atrT0Sl;
+    slLabel = `ATR-SL${(atrT0Sl*100).toFixed(0)}%`;
   } else {
     slThreshold = tsl.t0_sl || -0.07;
     slLabel = `SL${((tsl.t0_sl||-0.07)*100).toFixed(0)}%`;
@@ -1812,9 +1984,28 @@ for (const pos of openPos) {
     slLabel += `+MacroTighten`;
   }
 
-  const m   = await analyzeMarket(instId);
+  // Resolve oiPrev from state cache (2–8h old sample preferred)
+  const oiPrevHold = pickOiPrev(state, instId);
+  const m   = await analyzeMarket(instId, fg, oiPrevHold, params?.risk?.max_leverage_main || 12);
   if (!m) continue;
+  // Update OI history cache for next cycle
+  pushOiSample(state, instId, m.oiCurrent);
   const sig = generateSignal(m, cycle, fg, null, btcTrend, params);
+
+  // ── Sync exchange-side SL algo when tier advances (Fix #3b) ──────────────
+  const newSlPrice = ladderSlToPrice(entryPrice, slThreshold, lever, dir);
+  const prevExSl = state.openData?.[instId]?.currentExchangeSlPrice || null;
+  // Only amend when trigger moves meaningfully (>0.1% of entry) to avoid thrash
+  if (newSlPrice && (!prevExSl || Math.abs(newSlPrice - prevExSl) / entryPrice > 0.001)) {
+    try {
+      await syncExchangeSl(instId, dir, newSlPrice, state.openData?.[instId]);
+      if (!state.openData[instId]) state.openData[instId] = {};
+      state.openData[instId].currentExchangeSlPrice = newSlPrice;
+      console.log(`  ExchangeSL synced → ${formatPx(newSlPrice)} (${slLabel})`);
+    } catch (e) {
+      console.log(`  [WARN] Exchange SL sync failed: ${e.message}`);
+    }
+  }
 
   // Log SMC signals for open positions (trap warnings critical)
   const posSmcLog = [
@@ -1907,8 +2098,10 @@ const scanSummary = [];
 if (!FAST_MODE) {
 if (true) {
   for (const instId of WATCHLIST.filter(id=>!openIds.includes(id))) {
-    const m   = await analyzeMarket(instId);
+    const oiPrevScan = pickOiPrev(state, instId);
+    const m   = await analyzeMarket(instId, fg, oiPrevScan, params?.risk?.max_leverage_main || 12);
     if (!m) continue;
+    pushOiSample(state, instId, m.oiCurrent);
     const sig = generateSignal(m, cycle, fg, macroR, btcTrend, params);
     const rStr = sig.reasons.slice(0,6).join(' | ');
     // SMC summary display
@@ -1970,31 +2163,87 @@ if (true) {
       // Cooldown expired — clear it
       delete state.lastSL[instId];
     }
-    // OKX contract sizes: BTC=0.01BTC/ct, ETH=0.1ETH/ct, SOL=1SOL/ct
+    // OKX contract sizes: BTC=0.01BTC/ct, ETH=0.1ETH/ct, others=1unit/ct
     const ctUsdVal = instId.startsWith('BTC') ? 0.01*m.price
                    : instId.startsWith('ETH') ? 0.1*m.price
                    : 1*m.price;
-    // Use min leverage that allows at least 1 contract; cap at sig.leverage
-    const minLevNeeded = Math.ceil(ctUsdVal / (equity * 0.8));
+
+    // ── Fix #4: Session rules (max_leverage + size_multiplier) ─────────────
+    const session = getCurrentSession();
+    const sessionRule = params?.session_rules?.[session] || {};
+    const sessionMaxLev = sessionRule.max_leverage || 999;
+    const sessionSizeMult = sessionRule.size_multiplier || 1.0;
+
+    // ── Universal instrument profile (ATR + liquidity) ──────────────────────
+    const profile = m.profile;
     const maxLevParam  = params?.risk?.max_leverage_main || 12;
-    const useLev = Math.min(Math.max(sig.leverage, minLevNeeded), maxLevParam);
+    const maxLevByProfile = profile?.maxLev || maxLevParam;
+    const minLevNeeded = Math.ceil(ctUsdVal / (equity * 0.8));
+    const useLev = Math.min(
+      Math.max(sig.leverage, minLevNeeded),
+      maxLevParam,
+      maxLevByProfile,
+      sessionMaxLev
+    );
     if (useLev !== sig.leverage) {
-      console.log(`  Leverage adjusted: ${sig.leverage}x→${useLev}x (ctUsd=$${ctUsdVal.toFixed(0)}, need min ${minLevNeeded}x)`);
-      await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'long'});
-      await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'short'});
+      console.log(`  Leverage: sig=${sig.leverage}x → use=${useLev}x (prof=${maxLevByProfile}x sess=${sessionMaxLev}x minNeeded=${minLevNeeded}x)`);
     }
+
+    // ── ATR-based risk-targeted sizing (Fix #6 + universal formula) ─────────
     const riskPct = params?.risk?.risk_per_trade_main || RISK_PER_TRADE;
-    const sz     = Math.max(1, Math.floor(equity*riskPct*useLev*sig.sizeM/ctUsdVal));
-    console.log(`  → ${sig.direction.toUpperCase()} sz=${sz} lev=${useLev}x ~$${(sz*ctUsdVal).toFixed(0)} margin≈$${(sz*ctUsdVal/useLev).toFixed(0)}`);
-    // Must set leverage for both sides in long_short_mode
+    let sz, slPrice, tpPrice;
+    if (profile?.atr && profile?.atrPct) {
+      // risk USD = equity × risk% × session × liquidity × signal strength
+      const riskUsd = equity * riskPct * sessionSizeMult * profile.sizeMult * (sig.sizeM || 1);
+      const slDistance = profile.k_sl * profile.atr;
+      const tpDistance = profile.k_tp * profile.atr;
+      // Notional sized so that a slDistance move against us costs exactly riskUsd
+      const notionalUsd = riskUsd * (m.price / slDistance);
+      sz = Math.max(1, Math.floor(notionalUsd / ctUsdVal));
+      slPrice = sig.direction === 'long' ? m.price - slDistance : m.price + slDistance;
+      tpPrice = sig.direction === 'long' ? m.price + tpDistance : m.price - tpDistance;
+      console.log(`  ATR=${profile.atr.toFixed(4)} (${(profile.atrPct*100).toFixed(2)}%) sizeMult=${profile.sizeMult.toFixed(2)} liq=$${(profile.volUsd/1e6).toFixed(0)}M`);
+    } else {
+      // Fallback: legacy margin-% sizing if profile unavailable
+      sz = Math.max(1, Math.floor(equity*riskPct*useLev*(sig.sizeM||1)*sessionSizeMult/ctUsdVal));
+      slPrice = null;
+      tpPrice = null;
+      console.log(`  [WARN] No ATR profile — legacy sizing`);
+    }
+    console.log(`  → ${sig.direction.toUpperCase()} sz=${sz} lev=${useLev}x ~$${(sz*ctUsdVal).toFixed(0)} margin≈$${(sz*ctUsdVal/useLev).toFixed(0)} SL=${formatPx(slPrice)||'?'} TP=${formatPx(tpPrice)||'?'}`);
+
+    // Set leverage on both sides (hedge mode requires it)
     await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'long'});
     await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'short'});
-    const r = await apiPost('/api/v5/trade/order',{
-      instId, tdMode:'cross', side: sig.direction==='long' ? 'buy' : 'sell',
-      ordType:'market', sz:String(sz), posSide: sig.direction==='long' ? 'long' : 'short'
-    });
+
+    // ── Fix #3: Attach exchange-side SL/TP algo to the market entry ─────────
+    const orderBody = {
+      instId, tdMode:'cross',
+      side: sig.direction==='long' ? 'buy' : 'sell',
+      ordType:'market',
+      sz:String(sz),
+      posSide: sig.direction==='long' ? 'long' : 'short',
+    };
+    let slClOrdId = null;
+    if (slPrice && tpPrice) {
+      slClOrdId = `sl${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+      orderBody.attachAlgoOrds = [{
+        attachAlgoClOrdId: slClOrdId,
+        slTriggerPx: formatPx(slPrice),
+        slOrdPx: '-1',
+        slTriggerPxType: 'last',
+        tpTriggerPx: formatPx(tpPrice),
+        tpOrdPx: '-1',
+        tpTriggerPxType: 'last',
+      }];
+    }
+    const r = await apiPost('/api/v5/trade/order', orderBody);
     if (r?.code==='0') {
       const e = sig.direction==='long'?'LONG':'SHORT';
+      // Signed initial SL in uplRatio scale (negative = loss) for t0 override
+      const atrSlUplRatio = slPrice
+        ? -Math.abs((m.price - slPrice) / m.price) * useLev
+        : null;
       // Highlight smart money signals in notification
       const smcActive = [
         m.smc?.wyckoff     && `Spring(${m.smc.wyckoff.strength})`,
@@ -2005,13 +2254,21 @@ if (true) {
         m.smc?.absorption  && `Absorb:${m.smc.absorption.context}`,
         m.lsrLongPct       && `LSR:${(m.lsrLongPct*100).toFixed(0)}%L`,
       ].filter(Boolean).join(' ');
-      await tg(`*OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
+      await tg(`*OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nSL:$${formatPx(slPrice)||'-'} TP:$${formatPx(tpPrice)||'-'}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)} | Sess:${session}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
       if (!state.openData) state.openData = {};
       state.openData[instId] = {
         ts_open: ts, entry: m.price, leverage: useLev, confidence: sig.confidence,
         btc_bias: btcTrend?.bias || null, fear_greed: fg.value, funding_rate: m?.fr || null,
         claude_reasoning: state.openData?.[instId]?.claude_reasoning || null,
-        score_breakdown: sig.scoreBreakdown || null
+        score_breakdown: sig.scoreBreakdown || null,
+        atrSlPrice: slPrice,
+        atrTpPrice: tpPrice,
+        atrSlUplRatio,                            // signed, for t0 tier override
+        currentExchangeSlPrice: slPrice,          // tracks live exchange SL
+        slAlgoClOrdId: slClOrdId,                 // for amend-algos
+        atrAtEntry: profile?.atr || null,
+        atrPctAtEntry: profile?.atrPct || null,
+        session,
       };
       openNow.push({instId});
     } else {

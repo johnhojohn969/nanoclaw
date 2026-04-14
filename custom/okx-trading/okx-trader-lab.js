@@ -135,9 +135,79 @@ async function getFearGreed() {
 // ── State ─────────────────────────────────────────────────────────────────────
 function loadState() {
   try { if (existsSync(STATE_FILE)) return JSON.parse(readFileSync(STATE_FILE, 'utf-8')); } catch {}
-  return { peakEquity: 100, trades: [], log: [], lastTrade: {}, trailPeak: {}, lastSL: {} };
+  return { peakEquity: 100, trades: [], log: [], lastTrade: {}, trailPeak: {}, lastSL: {}, oiHistory: {} };
 }
 function saveState(s) { try { writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch {} }
+
+// ── OI history cache (for real OI divergence analysis) ───────────────────────
+function pushOiSample(state, instId, oiValue) {
+  if (!oiValue || !isFinite(oiValue)) return;
+  if (!state.oiHistory) state.oiHistory = {};
+  const rec = state.oiHistory[instId] || { samples: [] };
+  rec.samples = (rec.samples || []).filter(s => s && s.ts && s.oi);
+  rec.samples.push({ ts: new Date().toISOString(), oi: oiValue });
+  if (rec.samples.length > 24) rec.samples = rec.samples.slice(-24);
+  state.oiHistory[instId] = rec;
+}
+function pickOiPrev(state, instId) {
+  const rec = state.oiHistory?.[instId];
+  if (!rec?.samples?.length) return null;
+  const now = Date.now();
+  const candidates = rec.samples.filter(s => {
+    const age = now - new Date(s.ts).getTime();
+    return age >= 2 * 3600 * 1000 && age <= 8 * 3600 * 1000;
+  });
+  if (candidates.length) return candidates[0].oi;
+  const oldest = rec.samples[0];
+  const oldestAge = now - new Date(oldest.ts).getTime();
+  return oldestAge >= 3600 * 1000 ? oldest.oi : null;
+}
+
+// ── Exchange-side SL algo sync ───────────────────────────────────────────────
+async function syncExchangeSl(instId, dir, newSlTriggerPx, openDataEntry) {
+  const triggerPx = formatPx(newSlTriggerPx);
+  if (!triggerPx) throw new Error('invalid trigger px');
+  const posSide = (dir === 'LONG' || dir === 'long') ? 'long' : 'short';
+  const closeSide = posSide === 'long' ? 'sell' : 'buy';
+  const knownClId = openDataEntry?.slAlgoClOrdId || null;
+
+  if (knownClId) {
+    const amend = await apiPost('/api/v5/trade/amend-algos', [{
+      instId,
+      algoClOrdId: knownClId,
+      newSlTriggerPx: triggerPx,
+      newSlOrdPx: '-1',
+    }]).catch(e => ({ code: 'err', err: e.message }));
+    if (amend?.code === '0') return { mode: 'amend', clId: knownClId };
+  }
+
+  const pending = await apiGet(`/api/v5/trade/orders-algo-pending?ordType=conditional&instId=${instId}`)
+    .catch(() => null);
+  const live = (pending?.data || []).filter(a => a.posSide === posSide && a.slTriggerPx);
+  if (live.length) {
+    const cancelBody = live.map(a => ({ instId, algoId: a.algoId }));
+    await apiPost('/api/v5/trade/cancel-algos', cancelBody).catch(() => null);
+  }
+  const clId = `sl${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+  const posResp = await apiGet(`/api/v5/account/positions?instId=${instId}`).catch(() => null);
+  const live2 = (posResp?.data || []).find(p => p.posSide === posSide && Math.abs(parseFloat(p.pos)) > 0);
+  const sz = live2 ? Math.abs(parseFloat(live2.pos)) : null;
+  if (!sz) throw new Error('no open position for SL');
+  const post = await apiPost('/api/v5/trade/order-algo', {
+    instId, tdMode: 'cross',
+    side: closeSide, posSide,
+    ordType: 'conditional',
+    sz: String(sz),
+    slTriggerPx: triggerPx,
+    slOrdPx: '-1',
+    slTriggerPxType: 'last',
+    algoClOrdId: clId,
+    reduceOnly: 'true',
+  });
+  if (post?.code !== '0') throw new Error(`order-algo failed: ${post?.data?.[0]?.sMsg || JSON.stringify(post).slice(0,120)}`);
+  if (openDataEntry) openDataEntry.slAlgoClOrdId = clId;
+  return { mode: 'recreate', clId };
+}
 
 // ── Signal Journal (append-only .jsonl for post-analysis) ─────────────────────
 function journalWrite(entry) {
@@ -246,6 +316,58 @@ function rsiDiv(closes, n=14, lb=20) {
   if (Math.min(...ps.slice(h))<Math.min(...ps.slice(0,h))*0.998 && Math.min(...rs.slice(h))>Math.min(...rs.slice(0,h))*1.02) return 'bullish';
   if (Math.max(...ps.slice(h))>Math.max(...ps.slice(0,h))*1.002 && Math.max(...rs.slice(h))<Math.max(...rs.slice(0,h))*0.98) return 'bearish';
   return 'none';
+}
+
+// ── ATR (Average True Range) ──────────────────────────────────────────────────
+function atr(rawCandles, n = 14) {
+  if (!rawCandles || rawCandles.length < n + 1) return null;
+  const c = rawCandles.slice(0, n + 1).reverse();
+  let sum = 0;
+  for (let i = 1; i < c.length; i++) {
+    const high = parseFloat(c[i][2]);
+    const low  = parseFloat(c[i][3]);
+    const prev = parseFloat(c[i - 1][4]);
+    const tr = Math.max(high - low, Math.abs(high - prev), Math.abs(low - prev));
+    sum += tr;
+  }
+  return sum / (c.length - 1);
+}
+
+// ── Universal instrument profile (ATR + liquidity, no per-coin tuning) ──────
+function getInstrumentProfile(c1hRaw, tickerRow, price, maxLevCap) {
+  const atr1h = atr(c1hRaw, 14);
+  if (!atr1h || !isFinite(atr1h) || !price) return null;
+  const atrPct = atr1h / price;
+  const volUsd = parseFloat(tickerRow?.volCcy24h || 0) * price;
+  const liquidityScore = Math.min(1, Math.max(0, (Math.log10(Math.max(volUsd, 1e6)) - 7) / 2));
+  const sizeMult = 0.4 + 0.6 * liquidityScore;
+  const maxLevFromVol = Math.max(3, Math.round(0.12 / Math.max(atrPct, 0.005)));
+  const maxLev = Math.min(maxLevCap, maxLevFromVol);
+  return {
+    atr: atr1h, atrPct, volUsd, liquidityScore, sizeMult, maxLev,
+    k_sl: 1.5, k_tp: 3.0,
+  };
+}
+
+function getCurrentSession() {
+  const hour = new Date().getUTCHours();
+  if (hour < 8)  return 'asian';
+  if (hour < 13) return 'london';
+  return 'ny';
+}
+
+function ladderSlToPrice(entryPrice, slUplRatio, leverage, direction) {
+  if (!entryPrice || !leverage) return null;
+  const pctFromEntry = slUplRatio / leverage;
+  const isLong = direction === 'long' || direction === 'LONG';
+  return isLong
+    ? entryPrice * (1 + pctFromEntry)
+    : entryPrice * (1 - pctFromEntry);
+}
+
+function formatPx(p) {
+  if (p == null || !isFinite(p)) return null;
+  return Number(p).toPrecision(6);
 }
 
 function detectLiqSweep(c4h, lookback=10) {
@@ -776,7 +898,7 @@ function analyzeOIDivergence(oiCurrent, oiPrev, priceChange) {
 // ════════════════════════════════════════════════════════════════════════════
 
 // ── Full Market Analysis ──────────────────────────────────────────────────────
-async function analyzeMarket(instId) {
+async function analyzeMarket(instId, fg = { value: 50 }, oiPrev = null, maxLev = 5) {
   const [c1h, c4h, c1d, tick, fund, oi, lsr] = await Promise.all([
     apiGet(`/api/v5/market/candles?instId=${instId}&bar=1H&limit=150`),
     apiGet(`/api/v5/market/candles?instId=${instId}&bar=4H&limit=100`),
@@ -793,12 +915,12 @@ async function analyzeMarket(instId) {
   const cd  = c1d.data.map(c=>parseFloat(c[4])).reverse();
   const v1  = c1h.data.map(c=>parseFloat(c[5])).reverse();
 
-  const price = parseFloat(tick.data?.[0]?.last || c1.at(-1));
+  const tickerRow = tick.data?.[0] || null;
+  const price = parseFloat(tickerRow?.last || c1.at(-1));
   const fr    = parseFloat(fund.data?.[0]?.fundingRate||0)*100;
 
   const oiCurrent = oi.data?.[0] ? parseFloat(oi.data[0].oi) : null;
-  const oiPrev    = null;
-  const priceChg24h = tick.data?.[0] ? (parseFloat(tick.data[0].last) - parseFloat(tick.data[0].open24h)) / parseFloat(tick.data[0].open24h) : 0;
+  const priceChg24h = tickerRow ? (parseFloat(tickerRow.last) - parseFloat(tickerRow.open24h)) / parseFloat(tickerRow.open24h) : 0;
 
   const lsrData   = lsr.data?.[0] ? parseFloat(lsr.data[0].longShortRatio) : null;
   const lsrLongPct = lsrData ? lsrData / (1 + lsrData) : null;
@@ -823,6 +945,9 @@ async function analyzeMarket(instId) {
   const fundLong=fr>0.08, fundShort=fr<-0.05;
   const nearHigh=price>h20*0.98, nearLow=price<l20*1.02;
 
+  // Universal instrument profile (ATR volatility + liquidity normalized)
+  const profile = getInstrumentProfile(c1h.data, tickerRow, price, maxLev);
+
   const c4raw = c4h.data;
   const smc = {
     bullTrap:    detectBullTrap(c4raw, rsi4rolling),
@@ -831,9 +956,9 @@ async function analyzeMarket(instId) {
     utad:        detectUTAD(c4raw, rsi4rolling),
     stopHunt:    detectStopHunt(c4raw, price),
     absorption:  detectAbsorption(c4raw),
-    fundingTrap: analyzeFundingTrap(fr, price, {value: 50}),
+    fundingTrap: analyzeFundingTrap(fr, price, fg),            // FIX: real F&G
     lsr:         analyzeLSRatio(lsrLongPct),
-    oiDiv:       analyzeOIDivergence(oiCurrent, oiCurrent, priceChg24h),
+    oiDiv:       analyzeOIDivergence(oiCurrent, oiPrev, priceChg24h), // FIX: real oiPrev
   };
 
   return {
@@ -844,6 +969,7 @@ async function analyzeMarket(instId) {
     trend4h: bullTrend?'BULL':bearTrend?'BEAR':'MIXED',
     smc, oiCurrent, lsrLongPct, priceChg24h,
     rsi4rolling,
+    profile,
   };
 }
 
@@ -1829,8 +1955,10 @@ for (const pos of openPos) {
     slLabel += `+MacroTighten`;
   }
 
-  const m   = await analyzeMarket(instId);
+  const oiPrevHold = pickOiPrev(state, instId);
+  const m   = await analyzeMarket(instId, fg, oiPrevHold, params?.risk?.max_leverage_lab || LAB_MAX_LEV);
   if (!m) continue;
+  pushOiSample(state, instId, m.oiCurrent);
   const sig = generateSignal(m, cycle, fg, null, btcTrend, params);
 
   // Log SMC signals for open positions
@@ -1916,8 +2044,10 @@ const openIds = openNow.map(p=>p.instId);
 
 if (true) {
   for (const instId of WATCHLIST.filter(id=>!openIds.includes(id))) {
-    const m   = await analyzeMarket(instId);
+    const oiPrevScan = pickOiPrev(state, instId);
+    const m   = await analyzeMarket(instId, fg, oiPrevScan, params?.risk?.max_leverage_lab || LAB_MAX_LEV);
     if (!m) continue;
+    pushOiSample(state, instId, m.oiCurrent);
     const sig = generateSignal(m, cycle, fg, macroR, btcTrend, params);
     const rStr = sig.reasons.slice(0,6).join(' | ');
     // SMC summary display
@@ -1991,23 +2121,72 @@ if (true) {
     const ctUsdVal = instId.startsWith('BTC') ? 0.01*m.price
                    : instId.startsWith('ETH') ? 0.1*m.price
                    : 1*m.price;
-    const minLevNeeded = Math.ceil(ctUsdVal / (equity * 0.8));
+
+    // ── Fix #4: Session rules (lab) ────────────────────────────────────────
+    const session = getCurrentSession();
+    const sessionRule = params?.session_rules?.[session] || {};
+    const sessionMaxLev = sessionRule.max_leverage || 999;
+    const sessionSizeMult = sessionRule.size_multiplier || 1.0;
+
+    // ── Universal instrument profile (ATR + liquidity, lab-capped) ─────────
+    const profile = m.profile;
     const labMaxLevParam = params?.risk?.max_leverage_lab || LAB_MAX_LEV;
-    const useLev = Math.min(Math.max(sig.leverage, minLevNeeded), labMaxLevParam);
+    const maxLevByProfile = profile?.maxLev || labMaxLevParam;
+    const minLevNeeded = Math.ceil(ctUsdVal / (equity * 0.8));
+    const useLev = Math.min(
+      Math.max(sig.leverage, minLevNeeded),
+      labMaxLevParam,
+      maxLevByProfile,
+      sessionMaxLev
+    );
     if (useLev !== sig.leverage) {
-      console.log(`  Leverage adjusted: ${sig.leverage}x→${useLev}x (ctUsd=$${ctUsdVal.toFixed(0)}, need min ${minLevNeeded}x)`);
-      await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'long'});
-      await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'short'});
+      console.log(`  [LAB] Leverage: sig=${sig.leverage}x → use=${useLev}x (prof=${maxLevByProfile}x sess=${sessionMaxLev}x)`);
     }
+
+    // ── ATR-based risk-targeted sizing (universal formula) ──────────────────
     const riskPct = params?.risk?.risk_per_trade_lab || RISK_PER_TRADE;
-    const sz     = Math.max(1, Math.floor(equity*riskPct*useLev*sig.sizeM/ctUsdVal));
-    console.log(`  → ${sig.direction.toUpperCase()} sz=${sz} lev=${useLev}x ~$${(sz*ctUsdVal).toFixed(0)} margin≈$${(sz*ctUsdVal/useLev).toFixed(0)}`);
+    let sz, slPrice, tpPrice;
+    if (profile?.atr && profile?.atrPct) {
+      const riskUsd = equity * riskPct * sessionSizeMult * profile.sizeMult * (sig.sizeM || 1);
+      const slDistance = profile.k_sl * profile.atr;
+      const tpDistance = profile.k_tp * profile.atr;
+      const notionalUsd = riskUsd * (m.price / slDistance);
+      sz = Math.max(1, Math.floor(notionalUsd / ctUsdVal));
+      slPrice = sig.direction === 'long' ? m.price - slDistance : m.price + slDistance;
+      tpPrice = sig.direction === 'long' ? m.price + tpDistance : m.price - tpDistance;
+      console.log(`  [LAB] ATR=${profile.atr.toFixed(4)} (${(profile.atrPct*100).toFixed(2)}%) sizeMult=${profile.sizeMult.toFixed(2)}`);
+    } else {
+      sz = Math.max(1, Math.floor(equity*riskPct*useLev*(sig.sizeM||1)*sessionSizeMult/ctUsdVal));
+      slPrice = null;
+      tpPrice = null;
+    }
+    console.log(`  → ${sig.direction.toUpperCase()} sz=${sz} lev=${useLev}x ~$${(sz*ctUsdVal).toFixed(0)} margin≈$${(sz*ctUsdVal/useLev).toFixed(0)} SL=${formatPx(slPrice)||'?'} TP=${formatPx(tpPrice)||'?'}`);
+
     await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'long'});
     await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'short'});
-    const r = await apiPost('/api/v5/trade/order',{
-      instId, tdMode:'cross', side: sig.direction==='long' ? 'buy' : 'sell',
-      ordType:'market', sz:String(sz), posSide: sig.direction==='long' ? 'long' : 'short'
-    });
+
+    // ── Fix #3: Attach exchange-side SL/TP algo at entry (lab) ─────────────
+    const orderBody = {
+      instId, tdMode:'cross',
+      side: sig.direction==='long' ? 'buy' : 'sell',
+      ordType:'market',
+      sz:String(sz),
+      posSide: sig.direction==='long' ? 'long' : 'short',
+    };
+    let slClOrdId = null;
+    if (slPrice && tpPrice) {
+      slClOrdId = `lab${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 14)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+      orderBody.attachAlgoOrds = [{
+        attachAlgoClOrdId: slClOrdId,
+        slTriggerPx: formatPx(slPrice),
+        slOrdPx: '-1',
+        slTriggerPxType: 'last',
+        tpTriggerPx: formatPx(tpPrice),
+        tpOrdPx: '-1',
+        tpTriggerPxType: 'last',
+      }];
+    }
+    const r = await apiPost('/api/v5/trade/order', orderBody);
     if (r?.code==='0') {
       const e = sig.direction==='long'?'LONG':'SHORT';
       const smcActive = [
@@ -2022,21 +2201,29 @@ if (true) {
       // Journal: record new entry
       journalWrite({ type:'open', instId, dir: sig.direction.toUpperCase(),
         price: m.price, sz, lev: useLev, score: sig.score, confidence: sig.confidence,
-        fg: fg.value, trend4h: m.trend4h, smc: smcActive||'none' });
+        fg: fg.value, trend4h: m.trend4h, smc: smcActive||'none',
+        slPrice, tpPrice, session });
       try {
         appendFileSync(JOURNAL_FILE_NANOCLAW, JSON.stringify({
           type: 'open', bot: 'lab', instId, dir: sig.direction.toUpperCase(),
           price: m.price, sz, lev: useLev, score: sig.score,
-          confidence: sig.confidence, fg: fg.value, ts: ts
+          confidence: sig.confidence, fg: fg.value, ts: ts,
+          slPrice, tpPrice, session
         }) + '\n');
       } catch {}
-      await tg(`*[LAB] OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
+      await tg(`*[LAB] OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nSL:$${formatPx(slPrice)||'-'} TP:$${formatPx(tpPrice)||'-'}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)} | Sess:${session}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
       if (!state.openData) state.openData = {};
       state.openData[instId] = {
         ts_open: ts, entry: m.price, leverage: useLev, confidence: sig.confidence,
         btc_bias: btcTrend?.bias || null, fear_greed: fg.value, funding_rate: m?.fr || null,
         claude_reasoning: state.openData?.[instId]?.claude_reasoning || null,
-        score_breakdown: sig.scoreBreakdown || null
+        score_breakdown: sig.scoreBreakdown || null,
+        atrSlPrice: slPrice,
+        atrTpPrice: tpPrice,
+        slAlgoClOrdId: slClOrdId,
+        atrAtEntry: profile?.atr || null,
+        atrPctAtEntry: profile?.atrPct || null,
+        session,
       };
       openNow.push({instId});
     } else {
