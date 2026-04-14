@@ -28,3 +28,9 @@ Notes on the 5-minute cadence:
     not exit/trailing responsiveness.
 
 Watchlist: ETH SOL XRP DOGE SUI
+
+Web monitor UI:
+  cd ui && OKX_STATE_DIR=../okx-state node server.js
+  → http://127.0.0.1:8787
+  Live dashboard reading journal.jsonl with SSE live-updates.
+  See ui/README.md for environment variables, API, and security notes.
