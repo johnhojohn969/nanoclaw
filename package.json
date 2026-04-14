@@ -11,6 +11,7 @@
     "predev": "node scripts/apply-custom.mjs",
     "dev": "tsx src/index.ts",
     "pretest": "node scripts/apply-custom.mjs",
+    "pretypecheck": "node scripts/apply-custom.mjs",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.ts\"",
     "format:fix": "prettier --write \"src/**/*.ts\"",
