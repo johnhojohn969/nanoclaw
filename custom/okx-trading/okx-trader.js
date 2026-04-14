@@ -210,6 +210,40 @@ async function syncExchangeSl(instId, dir, newSlTriggerPx, openDataEntry) {
   return { mode: 'recreate', clId };
 }
 
+// ── OKX native trailing stop (move_order_stop) ───────────────────────────────
+// Runs server-side at tick speed so profit-locking trails between cron cycles.
+// `callbackRatio` = how much retracement from HWM triggers the close (as a
+// decimal — "0.015" = 1.5%).
+// `activePx` = price that must be reached before the trail starts tracking;
+// prevents activation on initial noise right after entry.
+async function placeTrailingStop(instId, direction, entryPrice, atr, atrPct, sz) {
+  if (!atr || !atrPct || !sz) throw new Error('missing atr/sz');
+  const isLong = direction === 'long' || direction === 'LONG';
+  const posSide  = isLong ? 'long' : 'short';
+  const closeSide = isLong ? 'sell' : 'buy';
+  // Callback: 0.8 × natural 1H ATR%, minimum 0.6% (avoid impossibly tight trails)
+  const callbackRatio = Math.max(0.006, 0.8 * atrPct);
+  // Activation price: half an ATR in favor from entry. Trail dormant until then.
+  const activePx = isLong
+    ? entryPrice + 0.5 * atr
+    : entryPrice - 0.5 * atr;
+  const clId = `ts${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+  const body = {
+    instId, tdMode: 'cross',
+    side: closeSide, posSide,
+    ordType: 'move_order_stop',
+    sz: String(sz),
+    callbackRatio: callbackRatio.toFixed(4),
+    activePx: formatPx(activePx),
+    reduceOnly: 'true',
+    algoClOrdId: clId,
+  };
+  const r = await apiPost('/api/v5/trade/order-algo', body)
+    .catch(e => ({ code: 'err', err: e.message }));
+  if (r?.code === '0') return { clId, callbackRatio, activePx };
+  throw new Error(`trailing stop failed: ${r?.data?.[0]?.sMsg || r?.err || JSON.stringify(r).slice(0, 120)}`);
+}
+
 // ── Macro Check ───────────────────────────────────────────────────────────────
 function getMacroRestriction() {
   const today    = new Date().toISOString().slice(0, 10);
@@ -2409,6 +2443,22 @@ if (true) {
       const atrSlUplRatio = slPrice
         ? -Math.abs((m.price - slPrice) / m.price) * useLev
         : null;
+
+      // ── Place OKX native trailing stop (runs server-side at tick speed) ──
+      let trailInfo = null;
+      if (profile?.atr && profile?.atrPct) {
+        try {
+          trailInfo = await placeTrailingStop(instId, sig.direction, m.price, profile.atr, profile.atrPct, sz);
+          console.log(`  TrailStop: callback=${(trailInfo.callbackRatio*100).toFixed(2)}% activePx=${formatPx(trailInfo.activePx)}`);
+        } catch (trailErr) {
+          console.log(`  [WARN] TrailStop failed: ${trailErr.message}`);
+          cycleAlerts.push({
+            level: 'warning', icon: '⚠️',
+            text: `<b>${htmlEscape(instId.split('-')[0])}</b> trailing stop failed: ${htmlEscape(String(trailErr.message).slice(0, 60))}`,
+          });
+        }
+      }
+
       // Highlight smart money signals in notification
       const smcActive = [
         m.smc?.wyckoff     && `Spring(${m.smc.wyckoff.strength})`,
@@ -2419,7 +2469,10 @@ if (true) {
         m.smc?.absorption  && `Absorb:${m.smc.absorption.context}`,
         m.lsrLongPct       && `LSR:${(m.lsrLongPct*100).toFixed(0)}%L`,
       ].filter(Boolean).join(' ');
-      await tg(`*OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nSL:$${formatPx(slPrice)||'-'} TP:$${formatPx(tpPrice)||'-'}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)} | Sess:${session}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
+      const trailStr = trailInfo
+        ? `Trail:${(trailInfo.callbackRatio*100).toFixed(1)}%@${formatPx(trailInfo.activePx)}`
+        : 'Trail:none';
+      await tg(`*OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nSL:$${formatPx(slPrice)||'-'} TP:$${formatPx(tpPrice)||'-'} | ${trailStr}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)} | Sess:${session}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
       if (!state.openData) state.openData = {};
       state.openData[instId] = {
         ts_open: ts, entry: m.price, leverage: useLev, confidence: sig.confidence,
@@ -2431,6 +2484,9 @@ if (true) {
         atrSlUplRatio,                            // signed, for t0 tier override
         currentExchangeSlPrice: slPrice,          // tracks live exchange SL
         slAlgoClOrdId: slClOrdId,                 // for amend-algos
+        trailAlgoClOrdId: trailInfo?.clId || null,
+        trailCallbackRatio: trailInfo?.callbackRatio || null,
+        trailActivePx: trailInfo?.activePx || null,
         atrAtEntry: profile?.atr || null,
         atrPctAtEntry: profile?.atrPct || null,
         session,
@@ -2625,7 +2681,36 @@ if (!FAST_MODE) {
   const headline = headlineLines.join('\n');
   const detail   = detailLines.join('\n');
   const repHtml  = `${headline}\n<blockquote expandable>${detail}</blockquote>`;
-  await tgHtml(repHtml);
+
+  // ── Report throttling (Step B: 5-min cron but ~30-min report cadence) ────
+  // With cron running every 5 minutes we don't want to spam Telegram. Only
+  // send the full compact report when one of these is true:
+  //   1. ≥ 25 min since last full report (baseline ~30-min cadence)
+  //   2. A critical alert fired this cycle
+  //   3. Self-evolve bumped params.version since last cycle
+  //   4. Position count changed (open/close) — though open/close already
+  //      sends its own tg() notification, this also refreshes the dashboard
+  const FULL_REPORT_INTERVAL_MS = 25 * 60 * 1000;
+  const lastFullReportTs = state.lastFullReportTs || 0;
+  const timeSinceFullReport = Date.now() - lastFullReportTs;
+  const hasCritical = cycleAlerts.some(a => a.level === 'critical');
+  const prevPosCount = typeof state.lastPosCount === 'number' ? state.lastPosCount : -1;
+  const curPosCount = openNow.length;
+  const posChanged = prevPosCount !== -1 && prevPosCount !== curPosCount;
+  const shouldSendFull =
+    timeSinceFullReport >= FULL_REPORT_INTERVAL_MS ||
+    hasCritical ||
+    evolveBumped ||
+    posChanged;
+
+  if (shouldSendFull) {
+    await tgHtml(repHtml);
+    state.lastFullReportTs = Date.now();
+  } else {
+    const nextInMs = FULL_REPORT_INTERVAL_MS - timeSinceFullReport;
+    console.log(`[REPORT] Throttled — next full report in ${fmtDuration(nextInMs)} (no critical / no pos change)`);
+  }
+  state.lastPosCount = curPosCount;
 } // end !FAST_MODE compact report
 
 // Persist report-tracking fields for next cycle

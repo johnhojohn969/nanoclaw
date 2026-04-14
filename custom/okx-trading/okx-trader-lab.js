@@ -209,6 +209,37 @@ async function syncExchangeSl(instId, dir, newSlTriggerPx, openDataEntry) {
   return { mode: 'recreate', clId };
 }
 
+// ── OKX native trailing stop (move_order_stop) ───────────────────────────────
+// Server-side trail; tracks HWM at tick speed so lab positions self-protect
+// between cron cycles without bot intervention.
+async function placeTrailingStop(instId, direction, entryPrice, atr, atrPct, sz) {
+  if (!atr || !atrPct || !sz) throw new Error('missing atr/sz');
+  const isLong = direction === 'long' || direction === 'LONG';
+  const posSide  = isLong ? 'long' : 'short';
+  const closeSide = isLong ? 'sell' : 'buy';
+  // Lab is research-oriented — slightly tighter trail than main so we fire
+  // sooner and get more exit datapoints.
+  const callbackRatio = Math.max(0.005, 0.6 * atrPct);
+  const activePx = isLong
+    ? entryPrice + 0.3 * atr
+    : entryPrice - 0.3 * atr;
+  const clId = `lts${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 14)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+  const body = {
+    instId, tdMode: 'cross',
+    side: closeSide, posSide,
+    ordType: 'move_order_stop',
+    sz: String(sz),
+    callbackRatio: callbackRatio.toFixed(4),
+    activePx: formatPx(activePx),
+    reduceOnly: 'true',
+    algoClOrdId: clId,
+  };
+  const r = await apiPost('/api/v5/trade/order-algo', body)
+    .catch(e => ({ code: 'err', err: e.message }));
+  if (r?.code === '0') return { clId, callbackRatio, activePx };
+  throw new Error(`trailing stop failed: ${r?.data?.[0]?.sMsg || r?.err || JSON.stringify(r).slice(0, 120)}`);
+}
+
 // ── Signal Journal (append-only .jsonl for post-analysis) ─────────────────────
 function journalWrite(entry) {
   try {
@@ -2189,6 +2220,18 @@ if (true) {
     const r = await apiPost('/api/v5/trade/order', orderBody);
     if (r?.code==='0') {
       const e = sig.direction==='long'?'LONG':'SHORT';
+
+      // ── Place OKX native trailing stop (lab) ─────────────────────────────
+      let trailInfo = null;
+      if (profile?.atr && profile?.atrPct) {
+        try {
+          trailInfo = await placeTrailingStop(instId, sig.direction, m.price, profile.atr, profile.atrPct, sz);
+          console.log(`  [LAB] TrailStop: callback=${(trailInfo.callbackRatio*100).toFixed(2)}% activePx=${formatPx(trailInfo.activePx)}`);
+        } catch (trailErr) {
+          console.log(`  [LAB] [WARN] TrailStop failed: ${trailErr.message}`);
+        }
+      }
+
       const smcActive = [
         m.smc?.wyckoff     && `Spring(${m.smc.wyckoff.strength})`,
         m.smc?.utad        && `UTAD(${m.smc.utad.strength})`,
@@ -2202,16 +2245,23 @@ if (true) {
       journalWrite({ type:'open', instId, dir: sig.direction.toUpperCase(),
         price: m.price, sz, lev: useLev, score: sig.score, confidence: sig.confidence,
         fg: fg.value, trend4h: m.trend4h, smc: smcActive||'none',
-        slPrice, tpPrice, session });
+        slPrice, tpPrice, session,
+        trailCallback: trailInfo?.callbackRatio || null,
+        trailActivePx: trailInfo?.activePx || null });
       try {
         appendFileSync(JOURNAL_FILE_NANOCLAW, JSON.stringify({
           type: 'open', bot: 'lab', instId, dir: sig.direction.toUpperCase(),
           price: m.price, sz, lev: useLev, score: sig.score,
           confidence: sig.confidence, fg: fg.value, ts: ts,
-          slPrice, tpPrice, session
+          slPrice, tpPrice, session,
+          trailCallback: trailInfo?.callbackRatio || null,
+          trailActivePx: trailInfo?.activePx || null
         }) + '\n');
       } catch {}
-      await tg(`*[LAB] OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nSL:$${formatPx(slPrice)||'-'} TP:$${formatPx(tpPrice)||'-'}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)} | Sess:${session}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
+      const labTrailStr = trailInfo
+        ? `Trail:${(trailInfo.callbackRatio*100).toFixed(1)}%@${formatPx(trailInfo.activePx)}`
+        : 'Trail:none';
+      await tg(`*[LAB] OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nSL:$${formatPx(slPrice)||'-'} TP:$${formatPx(tpPrice)||'-'} | ${labTrailStr}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)} | Sess:${session}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
       if (!state.openData) state.openData = {};
       state.openData[instId] = {
         ts_open: ts, entry: m.price, leverage: useLev, confidence: sig.confidence,
@@ -2221,6 +2271,9 @@ if (true) {
         atrSlPrice: slPrice,
         atrTpPrice: tpPrice,
         slAlgoClOrdId: slClOrdId,
+        trailAlgoClOrdId: trailInfo?.clId || null,
+        trailCallbackRatio: trailInfo?.callbackRatio || null,
+        trailActivePx: trailInfo?.activePx || null,
         atrAtEntry: profile?.atr || null,
         atrPctAtEntry: profile?.atrPct || null,
         session,
