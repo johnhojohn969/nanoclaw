@@ -21,6 +21,7 @@ const PASS    = "AndyTaylor1@";
 // ── Risk Config ───────────────────────────────────────────────────────────────
 const WATCHLIST      = ["ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP", "DOGE-USDT-SWAP", "SUI-USDT-SWAP"]; // BTC: signal only (see getBTCTrend)
 const MAX_POSITIONS  = 999;
+const FAST_MODE = process.argv.includes('--fast');
 const RISK_PER_TRADE = 0.08;
 const MAX_DRAWDOWN   = 0.20;
 const STATE_FILE     = process.env.OKX_STATE_DIR
@@ -897,7 +898,7 @@ function loadParams() {
     risk: { risk_per_trade_main: 0.08, max_positions_main: 999, max_drawdown_main: 0.20, max_leverage_main: 12, reentry_cooldown_ms: 14400000 },
     entry: { threshold_main: 0.75, ambiguous_zone_low: 0.60, ambiguous_zone_high: 0.90, tp_main: 0.20, initial_sl_main: -0.07 },
     leverage_tiers_main: { l3: 0.75, l5: 0.90, l8: 1.10, l12: 1.40 },
-    trailing_sl_main: { t0_sl: -0.07, t0_hwm: 0.00, t1_sl: -0.04, t1_hwm: 0.03, t2_sl: 0.00, t2_hwm: 0.05, t3_sl: 0.03, t3_hwm: 0.08, t4_trail: 0.05, t4_hwm: 0.12, t5_pct: 0.65, t5_hwm: 0.18, macro_tighten: -0.04 },
+    trailing_sl_main: { t0_sl: -0.07, t0_hwm: 0.00, t1_sl: -0.03, t1_hwm: 0.05, t2_sl: 0.00, t2_hwm: 0.10, t3_sl: 0.05, t3_hwm: 0.15, t4_sl: 0.10, t4_hwm: 0.20, t5_pct: 0.70, t5_hwm: 0.30, macro_tighten: -0.04 },
     signal_weights: { btc_trend: 0.6, cycle_bias: 0.8, seasonal_bias: 0.5, daily_trend: 0.25, trend_4h: 0.25, rsi_daily_os: 0.40, rsi_daily_ob: -0.35, rsi_4h_os: 0.40, rsi_4h_ob: -0.30, rsi_1h_os: 0.25, rsi_1h_ob: -0.20, rsi_div_4h: 0.45, rsi_div_1h: 0.20, macd: 0.20, bollinger: 0.30, key_level: 0.15, funding_rate: 0.30, liq_sweep: 0.50, fvg: 0.25, vol_high_mult: 1.25, vol_low_mult: 0.80, smc_wyckoff_strong: 0.75, smc_wyckoff_medium: 0.55, smc_wyckoff_weak: 0.35, smc_utad_strong: 0.70, smc_utad_weak: 0.40, smc_bull_trap_strong: 0.65, smc_bull_trap_weak: 0.35, smc_bear_trap_strong: 0.65, smc_bear_trap_weak: 0.35, stop_hunt_round: 0.60, stop_hunt_normal: 0.45, absorption: 0.30, fr_trap_long_extreme: 0.40, fr_trap_long_high: 0.25, fr_trap_short_extreme: 0.45, fr_trap_short_elevated: 0.25, lsr_65pct: 0.35, lsr_60pct: 0.20, lsr_35pct: 0.35, lsr_40pct: 0.20, oi_up_oi_down: 0.30, oi_down_oi_down: 0.20, oi_up_oi_up: 0.15, oi_down_oi_up: 0.15, retail_fomo: 0.35, retail_panic: 0.40, retail_chase: 0.20, retail_despair: 0.25, post_flush: 0.15, bear_trap_fear_bonus: 0.30, bull_trap_greed_bonus: 0.30 },
     hard_limits: { max_risk_per_trade: 0.08, max_drawdown: 0.20, max_leverage: 12, min_entry_threshold: 0.55, max_weight_delta_per_update: 0.15 },
     evolve: { enabled: true, min_trades_for_analysis: 10, poor_wr_threshold: 0.50, interval_ms: 21600000, last_evolved_at: null },
@@ -1759,11 +1760,13 @@ if (!state.openData)  state.openData = {};
 
 const REENTRY_COOLDOWN_MS = params?.risk?.reentry_cooldown_ms || 4 * 3600 * 1000;
 
+const posInfo = {}; // track trailing state per position for report
 for (const pos of openPos) {
   const instId    = pos.instId;
   const upl       = parseFloat(pos.upl);
-  const pnlPct    = upl / equity;
-  const dir       = parseFloat(pos.pos) > 0 ? 'LONG' : 'SHORT';
+  const pnlPct    = parseFloat(pos.uplRatio) || (upl / equity); // uplRatio = OKX position-margin PnL%
+  // hedge mode: pos.pos always positive; use posSide for direction
+  const dir       = pos.posSide === 'short' ? 'SHORT' : pos.posSide === 'long' ? 'LONG' : parseFloat(pos.pos) > 0 ? 'LONG' : 'SHORT';
   const lever     = parseFloat(pos.lever);
   const entryPrice = parseFloat(pos.avgPx);
   console.log(`[HOLD] ${instId} ${dir} ${lever}x | ${upl>=0?'+':''}$${upl.toFixed(2)} (${(pnlPct*100).toFixed(1)}%)`);
@@ -1775,21 +1778,28 @@ for (const pos of openPos) {
   // ── Tiered SL threshold (tightens as position profits) — uses params ─────
   const tsl = params?.trailing_sl_main || {};
   let slThreshold, slLabel;
-  if (hwm >= (tsl.t5_hwm || 0.18)) {
-    slThreshold = hwm * (tsl.t5_pct || 0.65);
-    slLabel = `Trail${((tsl.t5_pct||0.65)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%→SL:${(slThreshold*100).toFixed(0)}%)`;
-  } else if (hwm >= (tsl.t4_hwm || 0.12)) {
-    slThreshold = Math.max(hwm - (tsl.t4_trail || 0.05), 0.04);
-    slLabel = `Trail-${((tsl.t4_trail||0.05)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%→SL:${(slThreshold*100).toFixed(0)}%)`;
-  } else if (hwm >= (tsl.t3_hwm || 0.08)) {
-    slThreshold = tsl.t3_sl || 0.03;
-    slLabel = `LockIn+${((tsl.t3_sl||0.03)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%)`;
-  } else if (hwm >= (tsl.t2_hwm || 0.05)) {
+  // Tiered SL — thresholds in position-margin % (pos.uplRatio scale)
+  // t5: hwm≥30% → trail at 70% of hwm
+  // t4: hwm≥20% → HARD LOCK at +10%
+  // t3: hwm≥15% → HARD LOCK at +5%
+  // t2: hwm≥10% → break-even
+  // t1: hwm≥5%  → tighten SL to -3%
+  // t0: default  → initial SL -7%
+  if (hwm >= (tsl.t5_hwm || 0.30)) {
+    slThreshold = hwm * (tsl.t5_pct || 0.70);
+    slLabel = `Trail${((tsl.t5_pct||0.70)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%→SL:${(slThreshold*100).toFixed(0)}%)`;
+  } else if (hwm >= (tsl.t4_hwm || 0.20)) {
+    slThreshold = tsl.t4_sl || 0.10;
+    slLabel = `Lock+${((tsl.t4_sl||0.10)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%)`;
+  } else if (hwm >= (tsl.t3_hwm || 0.15)) {
+    slThreshold = tsl.t3_sl || 0.05;
+    slLabel = `Lock+${((tsl.t3_sl||0.05)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%)`;
+  } else if (hwm >= (tsl.t2_hwm || 0.10)) {
     slThreshold = tsl.t2_sl || 0.00;
     slLabel = `BreakEven(hwm:${(hwm*100).toFixed(0)}%)`;
-  } else if (hwm >= (tsl.t1_hwm || 0.03)) {
-    slThreshold = tsl.t1_sl || -0.04;
-    slLabel = `Tight${((tsl.t1_sl||-0.04)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%)`;
+  } else if (hwm >= (tsl.t1_hwm || 0.05)) {
+    slThreshold = tsl.t1_sl || -0.03;
+    slLabel = `Tight${((tsl.t1_sl||-0.03)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%)`;
   } else {
     slThreshold = tsl.t0_sl || -0.07;
     slLabel = `SL${((tsl.t0_sl||-0.07)*100).toFixed(0)}%`;
@@ -1815,18 +1825,22 @@ for (const pos of openPos) {
     m.smc?.stopHunt  && `StopHunt:${m.smc.stopHunt.type.includes('bull')?'up':'down'}`,
   ].filter(Boolean).join(' ');
   if (posSmcLog) console.log(`  SMC: ${posSmcLog}`);
+  posInfo[instId] = { hwm, slLabel, pnlPct };
   console.log(`  ${slLabel} | hwm:${(hwm*100).toFixed(1)}% cur:${(pnlPct*100).toFixed(1)}%`);
 
-  const tpPct = params?.entry?.tp_main || 0.20;
-  const tp  = pnlPct >= tpPct;
+  const tpPct = params?.entry?.tp_main || 0.40; // 40% cap (RSI TP triggers earlier)
+  // RSI-TP: loosened thresholds (4H: 65/35 ← 75/25) + added 1H trigger (70/30)
+  const rsiTp = (dir==='LONG'  && (m.r4 > 65 || m.r1 > 70) && m.nearHigh)
+             || (dir==='SHORT' && (m.r4 < 35 || m.r1 < 30) && m.nearLow);
+  const tp  = pnlPct >= tpPct || rsiTp;
   const sl  = pnlPct <= slThreshold;
   const rev = (dir==='LONG'&&sig.direction==='short'&&sig.confidence!=='low') ||
               (dir==='SHORT'&&sig.direction==='long'&&sig.confidence!=='low');
 
   if (tp||sl||rev) {
-    const reason = tp?`TP+${(tpPct*100).toFixed(0)}%`:sl?`SL[${slLabel}]`:'reversal';
+    const reason = (pnlPct>=tpPct)?`TP+${(tpPct*100).toFixed(0)}%`:rsiTp?`RSI-TP(${m.r4?.toFixed(0)}%)`:sl?`SL[${slLabel}]`:'reversal';
     console.log(`  → EXIT [${reason}]`);
-    const closePosSide = dir === 'LONG' ? 'long' : 'short';
+    const closePosSide = pos.posSide || (dir === 'LONG' ? 'long' : 'short');
     const closeSide    = dir === 'LONG' ? 'sell' : 'buy';
     const r = await apiPost('/api/v5/trade/order',{
       instId, tdMode:'cross', side: closeSide,
@@ -1874,6 +1888,10 @@ for (const pos of openPos) {
       } catch {}
       await tg(`${upl>=0?'WIN':'LOSS'} *${instId}* ${dir} closed\n${reason}: ${upl>=0?'+':''}$${upl.toFixed(2)} (${(pnlPct*100).toFixed(1)}%)\nHWM:${(hwm*100).toFixed(1)}% | Equity: $${equity.toFixed(2)}`);
       state.trades.push({instId,dir,upl,reason,ts});
+    } else {
+      const errMsg = r?.data?.[0]?.sMsg || JSON.stringify(r).slice(0,100);
+      console.log(`  [ERROR] Close FAILED: code=${r?.code} ${errMsg}`);
+      await tg(`⚠️ Close FAILED: ${instId} ${reason}\nCode:${r?.code} ${errMsg}`);
     }
   } else {
     console.log(`  → HOLD (sig:${sig.score.toFixed(2)})`);
@@ -1885,6 +1903,8 @@ const posR2  = await apiGet('/api/v5/account/positions');
 const openNow = (posR2.data||[]).filter(p=>Math.abs(parseFloat(p.pos))>0);
 const openIds = openNow.map(p=>p.instId);
 
+const scanSummary = [];
+if (!FAST_MODE) {
 if (true) {
   for (const instId of WATCHLIST.filter(id=>!openIds.includes(id))) {
     const m   = await analyzeMarket(instId);
@@ -1907,6 +1927,7 @@ if (true) {
     console.log(`       ${rStr}`);
     if (sbStr) console.log(`       [breakdown] ${sbStr}`);
     if (smcLog) console.log(`       SMC: ${smcLog}`);
+    scanSummary.push({id:instId.split('-')[0],dir:sig.direction,score:sig.score,conf:sig.confidence});
     if (!sig.direction || sig.confidence==='low' || sig.confidence==='none') {
       // Check ambiguous zone: ask Claude for a second opinion
       const absScore = Math.abs(sig.score);
@@ -1999,12 +2020,36 @@ if (true) {
     await new Promise(r=>setTimeout(r,1000));
   }
 }
+} // end !FAST_MODE scan+entry
 
-// Self-evolution check (runs every 6h)
+// Self-evolution check (runs every 6h, skipped in fast mode)
+if (!FAST_MODE) {
 await selfEvolve(params, state);
 await sanityCheck(params, state);
+}
 
 state.log.push({ts, equity, fg: fg.value, openPos: openNow.length});
 if (state.log.length > 500) state.log = state.log.slice(-500);
+if (!FAST_MODE) {
+// compact report (no AI)
+const _NL = String.fromCharCode(10);
+const _holds = openNow.map(function(p){
+  var sym=p.instId.split('-')[0];
+  var pnlR=parseFloat(p.uplRatio),upl=parseFloat(p.upl),pct=(pnlR||0)*100;
+  var dir=p.posSide==='short'?'S':p.posSide==='long'?'L':parseFloat(p.pos)>0?'L':'S',lev=parseFloat(p.lever);
+  var info=posInfo&&posInfo[p.instId];
+  var trailStr=info?(' [hwm:'+(info.hwm*100).toFixed(0)+'% '+info.slLabel+']'):'';
+  return sym+' '+dir+lev+'x '+(pct>=0?'+':'')+pct.toFixed(1)+'%'+trailStr;
+}).join(_NL);
+const _scans = scanSummary.filter(function(x){return x.dir||Math.abs(x.score)>=0.5;}).map(function(x){
+  return (x.conf==='medium'||x.conf==='high'?'':'~')+x.id+':'+(x.dir?x.dir.toUpperCase():'wait');
+}).join(' | ');
+const _dd=((state.peakEquity-equity)/state.peakEquity*100).toFixed(1);
+const _btc=(btcTrend&&btcTrend.bias)?btcTrend.bias:'?';
+const _rep='*OKX* $'+equity.toFixed(2)+'  DD:'+_dd+'% | FG:'+fg.value+' BTC:'+_btc
+  +(_holds?_NL+_holds:'')
+  +(_scans?_NL+'Scan: '+_scans:'');
+await tg(_rep);
+} // end !FAST_MODE compact report
 saveState(state);
 console.log(`\n${'═'.repeat(65)}`);

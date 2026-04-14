@@ -1,6 +1,6 @@
 {
-  "version": 0,
-  "update_reason": "defaults",
+  "version": 1,
+  "update_reason": "manual: boost short-term weights (volatile regime), reduce cycle_bias dominance",
   "risk": {
     "risk_per_trade_lab": 0.02,
     "max_positions_lab": 999,
@@ -13,7 +13,10 @@
     "ambiguous_zone_low": 0.35,
     "ambiguous_zone_high": 0.65,
     "tp_lab": 0.06,
-    "initial_sl_lab": -0.04
+    "initial_sl_lab": -0.04,
+    "threshold_main": 0.75,
+    "tp_main": 0.4,
+    "initial_sl_main": -0.07
   },
   "leverage_tiers_lab": {
     "l2": 0.45,
@@ -36,16 +39,16 @@
   },
   "signal_weights": {
     "btc_trend": 0.6,
-    "cycle_bias": 0.8,
+    "cycle_bias": 0.5,
     "seasonal_bias": 0.5,
     "daily_trend": 0.25,
-    "trend_4h": 0.25,
+    "trend_4h": 0.4,
     "rsi_daily_os": 0.4,
     "rsi_daily_ob": -0.35,
     "rsi_4h_os": 0.4,
     "rsi_4h_ob": -0.3,
-    "rsi_1h_os": 0.25,
-    "rsi_1h_ob": -0.2,
+    "rsi_1h_os": 0.35,
+    "rsi_1h_ob": -0.3,
     "rsi_div_4h": 0.45,
     "rsi_div_1h": 0.2,
     "macd": 0.2,
@@ -147,12 +150,27 @@
   },
   "sanity": {
     "check_interval_ms": 86400000,
-    "last_checked_at": "2026-04-11T04:15:03.790Z",
+    "last_checked_at": "2026-04-13T04:30:04.281Z",
     "alert_thresholds": {
       "wr_floor_20trades": 0.35,
       "consecutive_sl": 4,
       "version_bumps_per_day": 3,
       "journal_gap_hours": 2
     }
-  }
+  },
+  "updated_at": "2026-04-13T23:22:50.050Z",
+  "_version_history": [
+    {
+      "version": 1,
+      "reason": "manual: boost short-term weights (volatile regime), reduce cycle_bias dominance",
+      "ts": "2026-04-13T23:22:50.050Z",
+      "changes": {
+        "cycle_bias": "0.8 → 0.5",
+        "trend_4h": "0.25 → 0.4",
+        "rsi_1h_os": "0.25 → 0.35",
+        "rsi_1h_ob": "-0.2 → -0.3",
+        "tp_main": "0.2 → 0.4"
+      }
+    }
+  ]
 }
