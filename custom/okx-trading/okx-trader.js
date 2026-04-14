@@ -2085,6 +2085,14 @@ const REENTRY_COOLDOWN_MS = params?.risk?.reentry_cooldown_ms || 4 * 3600 * 1000
 // Each: { level: 'critical'|'warning'|'info', icon, text }
 const cycleAlerts = [];
 const posInfo = {}; // track trailing + monitor fields per position for report
+
+// ── Telemetry buffers for the structured cycle_snapshot event ───────────────
+// See the "STRUCTURED CYCLE TELEMETRY" block at the end of main for schema.
+// These are appended to by the hold-loop and scan-loop below, then serialized
+// as one JSONL record per cycle so downstream UI / analytics tools can
+// reconstruct what the bot saw and decided, indicator-by-indicator.
+const posSnapshot  = [];
+const scanSnapshot = [];
 for (const pos of openPos) {
   const instId    = pos.instId;
   const upl       = parseFloat(pos.upl);
@@ -2224,6 +2232,35 @@ for (const pos of openPos) {
   if (!state.openData[instId]) state.openData[instId] = {};
   state.openData[instId].lastScore = curScore;
 
+  // ── Flat per-position record for the cycle_snapshot event ──────────────
+  posSnapshot.push({
+    instId,
+    dir, lever,
+    entry: entryPrice,
+    current: m.price,
+    pnl_pct: pnlPct,
+    upl,
+    age_ms: ageMs,
+    hwm,
+    sl_price: slPriceAbs,
+    sl_label: slLabel,
+    dist_to_sl_pct: distToSlPct,
+    exchange_sl_ok: exchangeSlOk,
+    atr_at_entry: od.atrAtEntry || null,
+    atr_pct_at_entry: od.atrPctAtEntry || null,
+    atr_pct_now: m.profile?.atrPct || null,
+    session_at_entry: od.session || null,
+    entry_score: entryScoreVal,
+    current_score: curScore,
+    confidence: sig.confidence,
+    funding_rate: m.fr,
+    risk_usd_at_entry: riskUsdAtEntry,
+    smc_tags: posSmcLog || null,
+    trail_algo_cl_ord_id: od.trailAlgoClOrdId || null,
+    trail_callback_ratio: od.trailCallbackRatio || null,
+    trail_active_px: od.trailActivePx || null,
+  });
+
   // ── Per-position alert detection ────────────────────────────────────────
   const sym = instId.split('-')[0];
   // Close to SL (critical < 0.5%, warning < 1.2%)
@@ -2271,9 +2308,23 @@ for (const pos of openPos) {
   const sl  = pnlPct <= slThreshold;
   const rev = (dir==='LONG'&&sig.direction==='short'&&sig.confidence!=='low') ||
               (dir==='SHORT'&&sig.direction==='long'&&sig.confidence!=='low');
+  // ── FADE exit: score crosses neutrality vs our direction ────────────────
+  // Entry needs |score| ≥ 0.75 (high conviction); exit only needs score to
+  // cross fade_exit_threshold (default 0.0 = neutrality). The asymmetry
+  // yields hysteresis — 0.75-wide gap prevents whipsaw, and the SL-only
+  // 4h reentry cooldown still applies to losing exits.
+  const fadeTh = (params?.entry?.fade_exit_threshold != null) ? params.entry.fade_exit_threshold : 0.0;
+  const fade = (dir === 'LONG'  && sig.score <  fadeTh)
+            || (dir === 'SHORT' && sig.score > -fadeTh);
 
-  if (tp||sl||rev) {
-    const reason = (pnlPct>=tpPct)?`TP+${(tpPct*100).toFixed(0)}%`:rsiTp?`RSI-TP(${m.r4?.toFixed(0)}%)`:sl?`SL[${slLabel}]`:'reversal';
+  if (tp||sl||rev||fade) {
+    let exitReasonType;
+    let reason;
+    if (pnlPct>=tpPct)     { exitReasonType = 'tp';      reason = `TP+${(tpPct*100).toFixed(0)}%`; }
+    else if (rsiTp)        { exitReasonType = 'rsi_tp';  reason = `RSI-TP(${m.r4?.toFixed(0)}%)`; }
+    else if (sl)           { exitReasonType = 'sl';      reason = `SL[${slLabel}]`; }
+    else if (rev)          { exitReasonType = 'rev';     reason = 'reversal'; }
+    else /* fade */        { exitReasonType = 'fade';    reason = `fade(score=${sig.score.toFixed(2)})`; }
     console.log(`  → EXIT [${reason}]`);
     const closePosSide = pos.posSide || (dir === 'LONG' ? 'long' : 'short');
     const closeSide    = dir === 'LONG' ? 'sell' : 'buy';
@@ -2302,7 +2353,7 @@ for (const pos of openPos) {
         const hour = new Date().getUTCHours();
         const session = hour>=0&&hour<8?'asian':hour>=8&&hour<13?'london':'ny';
         appendFileSync(JOURNAL_FILE_NANOCLAW, JSON.stringify({
-          type: 'close', bot: 'main',
+          type: 'close', schemaVersion: 1, bot: 'main',
           ts_open: od.ts_open || null,
           ts_close: ts,
           instrument: instId,
@@ -2311,9 +2362,12 @@ for (const pos of openPos) {
           exit: m?.price || null,
           pnl_pct: pnlPct,
           exit_reason: reason,
+          exit_reason_type: exitReasonType, // tp | rsi_tp | sl | rev | fade
           session,
           params_version: params.version,
           score: sig.score,
+          entry_score: od.entryScore != null ? od.entryScore : null,
+          fade_threshold: fadeTh,
           primary_signal: (sig.reasons||[])[0] || null,
           signals_fired: sig.reasons || [],
           leverage: lever,
@@ -2371,6 +2425,63 @@ if (true) {
     if (sbStr) console.log(`       [breakdown] ${sbStr}`);
     if (smcLog) console.log(`       SMC: ${smcLog}`);
     scanSummary.push({id:instId.split('-')[0],dir:sig.direction,score:sig.score,conf:sig.confidence});
+
+    // ── Flat per-scan record for the cycle_snapshot event (schema v1) ──────
+    // Captures every indicator value + the final decision for each instrument
+    // so a downstream UI / notebook can reconstruct the bot's view.
+    scanSnapshot.push({
+      instId,
+      price: m.price,
+      fr: m.fr,
+      // Trend / momentum
+      rsi_1h: m.r1, rsi_4h: m.r4, rsi_d: m.rd,
+      rsi_div_4h: m.div4, rsi_div_1h: m.div1,
+      macd_hist: m.macd4?.hist ?? null,
+      macd_prev_hist: m.macd4?.prevHist ?? null,
+      bb_upper: m.bb?.upper ?? null, bb_mid: m.bb?.mid ?? null, bb_lower: m.bb?.lower ?? null,
+      bb_pct: m.bbp,
+      vol_ratio: m.vr,
+      trend_4h: m.trend4h,
+      bull_trend: m.bullTrend, bear_trend: m.bearTrend,
+      daily_bull: m.dailyBull,
+      near_high: m.nearHigh, near_low: m.nearLow,
+      fund_long: m.fundLong, fund_short: m.fundShort,
+      // Microstructure
+      oi_current: m.oiCurrent,
+      lsr_long_pct: m.lsrLongPct,
+      price_chg_24h: m.priceChg24h,
+      liq_sweep: m.liqSweep,
+      fvg: m.fvg,
+      // SMC (structured)
+      smc: {
+        wyckoff:      m.smc?.wyckoff?.strength      || null,
+        utad:         m.smc?.utad?.strength          || null,
+        bull_trap:    m.smc?.bullTrap?.strength      || null,
+        bear_trap:    m.smc?.bearTrap?.strength      || null,
+        stop_hunt:    m.smc?.stopHunt?.type          || null,
+        absorption:   m.smc?.absorption?.context     || null,
+        funding_trap: m.smc?.fundingTrap?.type       || null,
+        lsr:          m.smc?.lsr?.label              || null,
+        oi_div:       m.smc?.oiDiv?.label            || null,
+      },
+      // Profile (ATR + liquidity)
+      profile: m.profile ? {
+        atr: m.profile.atr,
+        atr_pct: m.profile.atrPct,
+        vol_usd: m.profile.volUsd,
+        liquidity_score: m.profile.liquidityScore,
+        size_mult: m.profile.sizeMult,
+        max_lev: m.profile.maxLev,
+      } : null,
+      // Decision
+      score: sig.score,
+      score_breakdown: sig.scoreBreakdown || null,
+      direction: sig.direction,
+      confidence: sig.confidence,
+      suggested_leverage: sig.leverage,
+      suggested_size_mult: sig.sizeM,
+      top_reasons: (sig.reasons || []).slice(0, 8),
+    });
     if (!sig.direction || sig.confidence==='low' || sig.confidence==='none') {
       // Check ambiguous zone: ask Claude for a second opinion
       const absScore = Math.abs(sig.score);
@@ -2786,6 +2897,65 @@ if (!FAST_MODE) {
   }
   state.lastPosCount = curPosCount;
 } // end !FAST_MODE compact report
+
+// ══════════════════════════════════════════════════════════════════════════
+// STRUCTURED CYCLE TELEMETRY (schemaVersion 1)
+// ══════════════════════════════════════════════════════════════════════════
+// One flat record per cycle, appended to journal.jsonl. Enables a downstream
+// UI / notebook / dashboard to reconstruct everything the bot saw + decided
+// at this point in time. Intentionally wide + flat (not nested) so it maps
+// cleanly to SQL / pandas DataFrames / DuckDB queries.
+//
+// Event schema:
+//   type:             "cycle_snapshot"
+//   schemaVersion:    1
+//   ts:               ISO8601
+//   bot:              "main" | "lab"
+//   params_version:   integer
+//   account:          { equity, peak_equity, dd, open_positions, consec_sl }
+//   context:          { fg, fg_label, fg_trend, btc_bias, btc_label,
+//                       cycle_phase, months_from_ath, session, macro_* }
+//   scan:             [ ...scanSnapshot ]        — one per non-open instrument
+//   positions:        [ ...posSnapshot ]         — one per open position
+//   alerts:           [ { level, text } ]        — cycle_alerts raised
+//
+// Consumers should branch on `type` and tolerate missing fields gracefully
+// when schemaVersion advances.
+try {
+  const cycleSnapshot = {
+    type: 'cycle_snapshot',
+    schemaVersion: 1,
+    ts,
+    bot: 'main',
+    params_version: params.version,
+    account: {
+      equity,
+      peak_equity: state.peakEquity,
+      dd: (state.peakEquity - equity) / state.peakEquity,
+      open_positions: openNow.length,
+      consecutive_sl: state.consecutiveSlCount || 0,
+    },
+    context: {
+      fg: fg.value,
+      fg_label: fg.label,
+      fg_trend: fg.trend,
+      btc_bias: btcTrend?.bias ?? null,
+      btc_label: btcTrend?.label ?? null,
+      btc_price: btcTrend?.price ?? null,
+      cycle_phase: cycle.phase,
+      months_from_ath: parseFloat(cycle.monthsFromATH),
+      session: getCurrentSession(),
+      macro_action: macroR?.action || null,
+      macro_event: macroR?.event || null,
+    },
+    scan: scanSnapshot,
+    positions: posSnapshot,
+    alerts: cycleAlerts.map(a => ({ level: a.level, text: a.text })),
+  };
+  appendFileSync(JOURNAL_FILE_NANOCLAW, JSON.stringify(cycleSnapshot) + '\n');
+} catch (snapErr) {
+  console.error('cycle_snapshot write failed:', snapErr.message);
+}
 
 // Persist report-tracking fields for next cycle
 state.lastEquity = equity;
