@@ -401,6 +401,49 @@ function formatPx(p) {
   return Number(p).toPrecision(6);
 }
 
+// ── OKX instrument spec cache (see main bot for full rationale) ──────────────
+// Different SWAPs have different ctVal (DOGE=1000, XRP=100, SUI=1, SOL=1,
+// ETH=0.1, BTC=0.01). Hardcoding breaks DOGE/XRP — fetch from the exchange.
+const _instSpecCache = new Map();
+async function getInstrumentSpec(instId) {
+  if (_instSpecCache.has(instId)) return _instSpecCache.get(instId);
+  const r = await apiGet(`/api/v5/public/instruments?instType=SWAP&instId=${instId}`)
+    .catch(e => ({ code: 'err', err: e.message }));
+  if (r?.code !== '0' || !r.data?.[0]) {
+    throw new Error(`instrument spec fetch failed for ${instId}: ${r?.err || r?.msg || JSON.stringify(r).slice(0,120)}`);
+  }
+  const d = r.data[0];
+  const spec = {
+    instId: d.instId,
+    ctVal:    parseFloat(d.ctVal) || 1,
+    ctValCcy: d.ctValCcy || null,
+    minSz:    parseFloat(d.minSz) || 1,
+    lotSz:    parseFloat(d.lotSz) || 1,
+    maxMktSz: d.maxMktSz ? parseFloat(d.maxMktSz) : Infinity,
+    tickSz:   parseFloat(d.tickSz) || null,
+  };
+  _instSpecCache.set(instId, spec);
+  return spec;
+}
+
+function snapSizeToSpec(rawSz, spec) {
+  let sz = Math.max(1, Math.floor(rawSz));
+  let note = '';
+  if (spec.lotSz && spec.lotSz > 0) {
+    sz = Math.floor(sz / spec.lotSz) * spec.lotSz;
+    if (sz <= 0) sz = spec.lotSz;
+  }
+  if (spec.minSz && sz < spec.minSz) {
+    sz = spec.minSz;
+    note += `min→${spec.minSz} `;
+  }
+  if (isFinite(spec.maxMktSz) && sz > spec.maxMktSz) {
+    note += `clamp ${sz}→${spec.maxMktSz}`;
+    sz = spec.maxMktSz;
+  }
+  return { sz, note: note.trim() };
+}
+
 function detectLiqSweep(c4h, lookback=10) {
   // Liquidity sweep: price briefly breaks below recent low then recovers above
   // = stop hunt before reversal — high win-rate long entry (68-72%)
@@ -2148,10 +2191,18 @@ if (true) {
       }
       delete state.lastSL[instId];
     }
-    // OKX contract sizes
-    const ctUsdVal = instId.startsWith('BTC') ? 0.01*m.price
-                   : instId.startsWith('ETH') ? 0.1*m.price
-                   : 1*m.price;
+
+    // ── OKX contract spec (ctVal / minSz / lotSz / maxMktSz) ────────────────
+    // Fetch real spec from exchange. Hardcoded DOGE=1 / XRP=1 was 1000x / 100x
+    // wrong and caused "Market order amount exceeds the maximum" rejects.
+    let spec;
+    try {
+      spec = await getInstrumentSpec(instId);
+    } catch (specErr) {
+      console.log(`  [LAB] [ERROR] ${specErr.message}`);
+      continue;
+    }
+    const ctUsdVal = spec.ctVal * m.price;
 
     // ── Fix #4: Session rules (lab) ────────────────────────────────────────
     const session = getCurrentSession();
@@ -2182,12 +2233,24 @@ if (true) {
       const slDistance = profile.k_sl * profile.atr;
       const tpDistance = profile.k_tp * profile.atr;
       const notionalUsd = riskUsd * (m.price / slDistance);
-      sz = Math.max(1, Math.floor(notionalUsd / ctUsdVal));
+      const rawSz = notionalUsd / ctUsdVal;
+      const snapped = snapSizeToSpec(rawSz, spec);
+      sz = snapped.sz;
+      if (snapped.note) console.log(`  [LAB] size snap: ${snapped.note}`);
+      // Guard: min-contract oversize (same as main)
+      const actualNotional = sz * ctUsdVal;
+      if (actualNotional > notionalUsd * 2) {
+        console.log(`  [LAB] [SKIP] Min contract inflates notional ${(actualNotional/notionalUsd).toFixed(1)}× target ($${actualNotional.toFixed(0)} vs $${notionalUsd.toFixed(0)}) — equity too small for ${spec.ctValCcy||instId}`);
+        continue;
+      }
       slPrice = sig.direction === 'long' ? m.price - slDistance : m.price + slDistance;
       tpPrice = sig.direction === 'long' ? m.price + tpDistance : m.price - tpDistance;
       console.log(`  [LAB] ATR=${profile.atr.toFixed(4)} (${(profile.atrPct*100).toFixed(2)}%) sizeMult=${profile.sizeMult.toFixed(2)}`);
     } else {
-      sz = Math.max(1, Math.floor(equity*riskPct*useLev*(sig.sizeM||1)*sessionSizeMult/ctUsdVal));
+      const rawSz = equity*riskPct*useLev*(sig.sizeM||1)*sessionSizeMult/ctUsdVal;
+      const snapped = snapSizeToSpec(rawSz, spec);
+      sz = snapped.sz;
+      if (snapped.note) console.log(`  [LAB] size snap: ${snapped.note}`);
       slPrice = null;
       tpPrice = null;
     }

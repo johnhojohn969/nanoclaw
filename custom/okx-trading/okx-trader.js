@@ -420,6 +420,58 @@ function formatPx(p) {
   return Number(p).toPrecision(6);
 }
 
+// ── OKX instrument spec cache ─────────────────────────────────────────────────
+// Different OKX SWAPs use very different ctVal:
+//   BTC-USDT-SWAP  = 0.01   BTC   per contract
+//   ETH-USDT-SWAP  = 0.1    ETH   per contract
+//   SOL-USDT-SWAP  = 1      SOL   per contract
+//   SUI-USDT-SWAP  = 1      SUI   per contract
+//   XRP-USDT-SWAP  = 100    XRP   per contract
+//   DOGE-USDT-SWAP = 1000   DOGE  per contract   ← blew up the old sizing code
+// Hardcoding is brittle, so we fetch from /public/instruments lazily and
+// cache in-process (cron process lives a few seconds per cycle anyway).
+const _instSpecCache = new Map();
+async function getInstrumentSpec(instId) {
+  if (_instSpecCache.has(instId)) return _instSpecCache.get(instId);
+  const r = await apiGet(`/api/v5/public/instruments?instType=SWAP&instId=${instId}`)
+    .catch(e => ({ code: 'err', err: e.message }));
+  if (r?.code !== '0' || !r.data?.[0]) {
+    throw new Error(`instrument spec fetch failed for ${instId}: ${r?.err || r?.msg || JSON.stringify(r).slice(0,120)}`);
+  }
+  const d = r.data[0];
+  const spec = {
+    instId: d.instId,
+    ctVal: parseFloat(d.ctVal) || 1,          // underlying units per contract
+    ctValCcy: d.ctValCcy || null,             // e.g. "DOGE"
+    minSz:    parseFloat(d.minSz) || 1,       // minimum contracts per order
+    lotSz:    parseFloat(d.lotSz) || 1,       // contract increment
+    maxMktSz: d.maxMktSz ? parseFloat(d.maxMktSz) : Infinity,  // market order cap
+    tickSz:   parseFloat(d.tickSz) || null,
+  };
+  _instSpecCache.set(instId, spec);
+  return spec;
+}
+
+// Snap a raw contract count to exchange rules (minSz, lotSz, maxMktSz).
+// Returns the final integer size AND a note describing any adjustment for logs.
+function snapSizeToSpec(rawSz, spec) {
+  let sz = Math.max(1, Math.floor(rawSz));
+  let note = '';
+  if (spec.lotSz && spec.lotSz > 0) {
+    sz = Math.floor(sz / spec.lotSz) * spec.lotSz;
+    if (sz <= 0) sz = spec.lotSz;
+  }
+  if (spec.minSz && sz < spec.minSz) {
+    sz = spec.minSz;
+    note += `min→${spec.minSz} `;
+  }
+  if (isFinite(spec.maxMktSz) && sz > spec.maxMktSz) {
+    note += `clamp ${sz}→${spec.maxMktSz}`;
+    sz = spec.maxMktSz;
+  }
+  return { sz, note: note.trim() };
+}
+
 // ── Display / report formatting helpers ─────────────────────────────────────
 function fmtMoney(n) {
   if (n == null || !isFinite(n)) return '?';
@@ -2361,10 +2413,18 @@ if (true) {
       // Cooldown expired — clear it
       delete state.lastSL[instId];
     }
-    // OKX contract sizes: BTC=0.01BTC/ct, ETH=0.1ETH/ct, others=1unit/ct
-    const ctUsdVal = instId.startsWith('BTC') ? 0.01*m.price
-                   : instId.startsWith('ETH') ? 0.1*m.price
-                   : 1*m.price;
+
+    // ── OKX contract spec (real ctVal / minSz / lotSz / maxMktSz per coin) ─
+    // Fetched from /public/instruments rather than hardcoded.
+    // Hardcoded table was wrong for DOGE (1000) and XRP (100), blowing up sizing.
+    let spec;
+    try {
+      spec = await getInstrumentSpec(instId);
+    } catch (specErr) {
+      console.log(`  [ERROR] ${specErr.message}`);
+      continue;
+    }
+    const ctUsdVal = spec.ctVal * m.price;
 
     // ── Fix #4: Session rules (max_leverage + size_multiplier) ─────────────
     const session = getCurrentSession();
@@ -2398,13 +2458,27 @@ if (true) {
       const tpDistance = profile.k_tp * profile.atr;
       // Notional sized so that a slDistance move against us costs exactly riskUsd
       const notionalUsd = riskUsd * (m.price / slDistance);
-      sz = Math.max(1, Math.floor(notionalUsd / ctUsdVal));
+      const rawSz = notionalUsd / ctUsdVal;
+      const snapped = snapSizeToSpec(rawSz, spec);
+      sz = snapped.sz;
+      if (snapped.note) console.log(`  size snap: ${snapped.note}`);
+      // Guard: if exchange min-contract forces notional way above the target
+      // (small equity on large-ctVal coins like DOGE/XRP), skip entirely
+      // rather than take unexpected oversized risk.
+      const actualNotional = sz * ctUsdVal;
+      if (actualNotional > notionalUsd * 2) {
+        console.log(`  [SKIP] Min contract inflates notional ${(actualNotional/notionalUsd).toFixed(1)}× target ($${actualNotional.toFixed(0)} vs $${notionalUsd.toFixed(0)}) — equity too small for ${spec.ctValCcy||instId}`);
+        continue;
+      }
       slPrice = sig.direction === 'long' ? m.price - slDistance : m.price + slDistance;
       tpPrice = sig.direction === 'long' ? m.price + tpDistance : m.price - tpDistance;
       console.log(`  ATR=${profile.atr.toFixed(4)} (${(profile.atrPct*100).toFixed(2)}%) sizeMult=${profile.sizeMult.toFixed(2)} liq=$${(profile.volUsd/1e6).toFixed(0)}M`);
     } else {
       // Fallback: legacy margin-% sizing if profile unavailable
-      sz = Math.max(1, Math.floor(equity*riskPct*useLev*(sig.sizeM||1)*sessionSizeMult/ctUsdVal));
+      const rawSz = equity*riskPct*useLev*(sig.sizeM||1)*sessionSizeMult/ctUsdVal;
+      const snapped = snapSizeToSpec(rawSz, spec);
+      sz = snapped.sz;
+      if (snapped.note) console.log(`  size snap: ${snapped.note}`);
       slPrice = null;
       tpPrice = null;
       console.log(`  [WARN] No ATR profile — legacy sizing`);
