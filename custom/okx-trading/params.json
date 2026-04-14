@@ -1,12 +1,16 @@
 {
-  "version": 0,
-  "update_reason": "defaults",
+  "version": 1,
+  "update_reason": "atr_universal_fix_v1",
   "risk": {
-    "risk_per_trade_main": 0.08,
-    "max_positions_main": 2,
-    "max_drawdown_main": 0.2,
+    "risk_per_trade_main": 0.01,
+    "max_positions_main": 4,
+    "max_drawdown_main": 0.15,
     "max_leverage_main": 12,
-    "reentry_cooldown_ms": 14400000
+    "reentry_cooldown_ms": 14400000,
+    "risk_per_trade_lab": 0.005,
+    "max_positions_lab": 4,
+    "max_drawdown_lab": 0.1,
+    "max_leverage_lab": 5
   },
   "entry": {
     "threshold_main": 0.75,
@@ -14,7 +18,8 @@
     "ambiguous_zone_high": 0.9,
     "tp_main": 0.2,
     "initial_sl_main": -0.07,
-    "threshold_lab": 0.55
+    "threshold_lab": 0.55,
+    "fade_exit_threshold": 0.0
   },
   "leverage_tiers_main": {
     "l3": 0.75,
@@ -92,8 +97,8 @@
     "bull_trap_greed_bonus": 0.3
   },
   "hard_limits": {
-    "max_risk_per_trade": 0.08,
-    "max_drawdown": 0.2,
+    "max_risk_per_trade": 0.02,
+    "max_drawdown": 0.15,
     "max_leverage": 12,
     "min_entry_threshold": 0.55,
     "max_weight_delta_per_update": 0.15
@@ -106,18 +111,11 @@
     "last_evolved_at": null
   },
   "instruments": [
-    {
-      "id": "ETH-USDT-SWAP",
-      "active": true
-    },
-    {
-      "id": "SOL-USDT-SWAP",
-      "active": true
-    },
-    {
-      "id": "AVAX-USDT-SWAP",
-      "active": true
-    }
+    { "id": "ETH-USDT-SWAP",  "active": true },
+    { "id": "SOL-USDT-SWAP",  "active": true },
+    { "id": "XRP-USDT-SWAP",  "active": true },
+    { "id": "DOGE-USDT-SWAP", "active": true },
+    { "id": "SUI-USDT-SWAP",  "active": true }
   ],
   "session_rules": {
     "asian": {

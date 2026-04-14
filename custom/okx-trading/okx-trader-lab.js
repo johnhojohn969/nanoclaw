@@ -135,9 +135,110 @@ async function getFearGreed() {
 // ── State ─────────────────────────────────────────────────────────────────────
 function loadState() {
   try { if (existsSync(STATE_FILE)) return JSON.parse(readFileSync(STATE_FILE, 'utf-8')); } catch {}
-  return { peakEquity: 100, trades: [], log: [], lastTrade: {}, trailPeak: {}, lastSL: {} };
+  return { peakEquity: 100, trades: [], log: [], lastTrade: {}, trailPeak: {}, lastSL: {}, oiHistory: {} };
 }
 function saveState(s) { try { writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch {} }
+
+// ── OI history cache (for real OI divergence analysis) ───────────────────────
+function pushOiSample(state, instId, oiValue) {
+  if (!oiValue || !isFinite(oiValue)) return;
+  if (!state.oiHistory) state.oiHistory = {};
+  const rec = state.oiHistory[instId] || { samples: [] };
+  rec.samples = (rec.samples || []).filter(s => s && s.ts && s.oi);
+  rec.samples.push({ ts: new Date().toISOString(), oi: oiValue });
+  if (rec.samples.length > 24) rec.samples = rec.samples.slice(-24);
+  state.oiHistory[instId] = rec;
+}
+function pickOiPrev(state, instId) {
+  const rec = state.oiHistory?.[instId];
+  if (!rec?.samples?.length) return null;
+  const now = Date.now();
+  const candidates = rec.samples.filter(s => {
+    const age = now - new Date(s.ts).getTime();
+    return age >= 2 * 3600 * 1000 && age <= 8 * 3600 * 1000;
+  });
+  if (candidates.length) return candidates[0].oi;
+  const oldest = rec.samples[0];
+  const oldestAge = now - new Date(oldest.ts).getTime();
+  return oldestAge >= 3600 * 1000 ? oldest.oi : null;
+}
+
+// ── Exchange-side SL algo sync ───────────────────────────────────────────────
+async function syncExchangeSl(instId, dir, newSlTriggerPx, openDataEntry) {
+  const triggerPx = formatPx(newSlTriggerPx);
+  if (!triggerPx) throw new Error('invalid trigger px');
+  const posSide = (dir === 'LONG' || dir === 'long') ? 'long' : 'short';
+  const closeSide = posSide === 'long' ? 'sell' : 'buy';
+  const knownClId = openDataEntry?.slAlgoClOrdId || null;
+
+  if (knownClId) {
+    const amend = await apiPost('/api/v5/trade/amend-algos', [{
+      instId,
+      algoClOrdId: knownClId,
+      newSlTriggerPx: triggerPx,
+      newSlOrdPx: '-1',
+    }]).catch(e => ({ code: 'err', err: e.message }));
+    if (amend?.code === '0') return { mode: 'amend', clId: knownClId };
+  }
+
+  const pending = await apiGet(`/api/v5/trade/orders-algo-pending?ordType=conditional&instId=${instId}`)
+    .catch(() => null);
+  const live = (pending?.data || []).filter(a => a.posSide === posSide && a.slTriggerPx);
+  if (live.length) {
+    const cancelBody = live.map(a => ({ instId, algoId: a.algoId }));
+    await apiPost('/api/v5/trade/cancel-algos', cancelBody).catch(() => null);
+  }
+  const clId = `sl${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+  const posResp = await apiGet(`/api/v5/account/positions?instId=${instId}`).catch(() => null);
+  const live2 = (posResp?.data || []).find(p => p.posSide === posSide && Math.abs(parseFloat(p.pos)) > 0);
+  const sz = live2 ? Math.abs(parseFloat(live2.pos)) : null;
+  if (!sz) throw new Error('no open position for SL');
+  const post = await apiPost('/api/v5/trade/order-algo', {
+    instId, tdMode: 'cross',
+    side: closeSide, posSide,
+    ordType: 'conditional',
+    sz: String(sz),
+    slTriggerPx: triggerPx,
+    slOrdPx: '-1',
+    slTriggerPxType: 'last',
+    algoClOrdId: clId,
+    reduceOnly: 'true',
+  });
+  if (post?.code !== '0') throw new Error(`order-algo failed: ${post?.data?.[0]?.sMsg || JSON.stringify(post).slice(0,120)}`);
+  if (openDataEntry) openDataEntry.slAlgoClOrdId = clId;
+  return { mode: 'recreate', clId };
+}
+
+// ── OKX native trailing stop (move_order_stop) ───────────────────────────────
+// Server-side trail; tracks HWM at tick speed so lab positions self-protect
+// between cron cycles without bot intervention.
+async function placeTrailingStop(instId, direction, entryPrice, atr, atrPct, sz) {
+  if (!atr || !atrPct || !sz) throw new Error('missing atr/sz');
+  const isLong = direction === 'long' || direction === 'LONG';
+  const posSide  = isLong ? 'long' : 'short';
+  const closeSide = isLong ? 'sell' : 'buy';
+  // Lab is research-oriented — slightly tighter trail than main so we fire
+  // sooner and get more exit datapoints.
+  const callbackRatio = Math.max(0.005, 0.6 * atrPct);
+  const activePx = isLong
+    ? entryPrice + 0.3 * atr
+    : entryPrice - 0.3 * atr;
+  const clId = `lts${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 14)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+  const body = {
+    instId, tdMode: 'cross',
+    side: closeSide, posSide,
+    ordType: 'move_order_stop',
+    sz: String(sz),
+    callbackRatio: callbackRatio.toFixed(4),
+    activePx: formatPx(activePx),
+    reduceOnly: 'true',
+    algoClOrdId: clId,
+  };
+  const r = await apiPost('/api/v5/trade/order-algo', body)
+    .catch(e => ({ code: 'err', err: e.message }));
+  if (r?.code === '0') return { clId, callbackRatio, activePx };
+  throw new Error(`trailing stop failed: ${r?.data?.[0]?.sMsg || r?.err || JSON.stringify(r).slice(0, 120)}`);
+}
 
 // ── Signal Journal (append-only .jsonl for post-analysis) ─────────────────────
 function journalWrite(entry) {
@@ -246,6 +347,101 @@ function rsiDiv(closes, n=14, lb=20) {
   if (Math.min(...ps.slice(h))<Math.min(...ps.slice(0,h))*0.998 && Math.min(...rs.slice(h))>Math.min(...rs.slice(0,h))*1.02) return 'bullish';
   if (Math.max(...ps.slice(h))>Math.max(...ps.slice(0,h))*1.002 && Math.max(...rs.slice(h))<Math.max(...rs.slice(0,h))*0.98) return 'bearish';
   return 'none';
+}
+
+// ── ATR (Average True Range) ──────────────────────────────────────────────────
+function atr(rawCandles, n = 14) {
+  if (!rawCandles || rawCandles.length < n + 1) return null;
+  const c = rawCandles.slice(0, n + 1).reverse();
+  let sum = 0;
+  for (let i = 1; i < c.length; i++) {
+    const high = parseFloat(c[i][2]);
+    const low  = parseFloat(c[i][3]);
+    const prev = parseFloat(c[i - 1][4]);
+    const tr = Math.max(high - low, Math.abs(high - prev), Math.abs(low - prev));
+    sum += tr;
+  }
+  return sum / (c.length - 1);
+}
+
+// ── Universal instrument profile (ATR + liquidity, no per-coin tuning) ──────
+function getInstrumentProfile(c1hRaw, tickerRow, price, maxLevCap) {
+  const atr1h = atr(c1hRaw, 14);
+  if (!atr1h || !isFinite(atr1h) || !price) return null;
+  const atrPct = atr1h / price;
+  const volUsd = parseFloat(tickerRow?.volCcy24h || 0) * price;
+  const liquidityScore = Math.min(1, Math.max(0, (Math.log10(Math.max(volUsd, 1e6)) - 7) / 2));
+  const sizeMult = 0.4 + 0.6 * liquidityScore;
+  const maxLevFromVol = Math.max(3, Math.round(0.12 / Math.max(atrPct, 0.005)));
+  const maxLev = Math.min(maxLevCap, maxLevFromVol);
+  return {
+    atr: atr1h, atrPct, volUsd, liquidityScore, sizeMult, maxLev,
+    k_sl: 1.5, k_tp: 3.0,
+  };
+}
+
+function getCurrentSession() {
+  const hour = new Date().getUTCHours();
+  if (hour < 8)  return 'asian';
+  if (hour < 13) return 'london';
+  return 'ny';
+}
+
+function ladderSlToPrice(entryPrice, slUplRatio, leverage, direction) {
+  if (!entryPrice || !leverage) return null;
+  const pctFromEntry = slUplRatio / leverage;
+  const isLong = direction === 'long' || direction === 'LONG';
+  return isLong
+    ? entryPrice * (1 + pctFromEntry)
+    : entryPrice * (1 - pctFromEntry);
+}
+
+function formatPx(p) {
+  if (p == null || !isFinite(p)) return null;
+  return Number(p).toPrecision(6);
+}
+
+// ── OKX instrument spec cache (see main bot for full rationale) ──────────────
+// Different SWAPs have different ctVal (DOGE=1000, XRP=100, SUI=1, SOL=1,
+// ETH=0.1, BTC=0.01). Hardcoding breaks DOGE/XRP — fetch from the exchange.
+const _instSpecCache = new Map();
+async function getInstrumentSpec(instId) {
+  if (_instSpecCache.has(instId)) return _instSpecCache.get(instId);
+  const r = await apiGet(`/api/v5/public/instruments?instType=SWAP&instId=${instId}`)
+    .catch(e => ({ code: 'err', err: e.message }));
+  if (r?.code !== '0' || !r.data?.[0]) {
+    throw new Error(`instrument spec fetch failed for ${instId}: ${r?.err || r?.msg || JSON.stringify(r).slice(0,120)}`);
+  }
+  const d = r.data[0];
+  const spec = {
+    instId: d.instId,
+    ctVal:    parseFloat(d.ctVal) || 1,
+    ctValCcy: d.ctValCcy || null,
+    minSz:    parseFloat(d.minSz) || 1,
+    lotSz:    parseFloat(d.lotSz) || 1,
+    maxMktSz: d.maxMktSz ? parseFloat(d.maxMktSz) : Infinity,
+    tickSz:   parseFloat(d.tickSz) || null,
+  };
+  _instSpecCache.set(instId, spec);
+  return spec;
+}
+
+function snapSizeToSpec(rawSz, spec) {
+  let sz = Math.max(1, Math.floor(rawSz));
+  let note = '';
+  if (spec.lotSz && spec.lotSz > 0) {
+    sz = Math.floor(sz / spec.lotSz) * spec.lotSz;
+    if (sz <= 0) sz = spec.lotSz;
+  }
+  if (spec.minSz && sz < spec.minSz) {
+    sz = spec.minSz;
+    note += `min→${spec.minSz} `;
+  }
+  if (isFinite(spec.maxMktSz) && sz > spec.maxMktSz) {
+    note += `clamp ${sz}→${spec.maxMktSz}`;
+    sz = spec.maxMktSz;
+  }
+  return { sz, note: note.trim() };
 }
 
 function detectLiqSweep(c4h, lookback=10) {
@@ -776,7 +972,7 @@ function analyzeOIDivergence(oiCurrent, oiPrev, priceChange) {
 // ════════════════════════════════════════════════════════════════════════════
 
 // ── Full Market Analysis ──────────────────────────────────────────────────────
-async function analyzeMarket(instId) {
+async function analyzeMarket(instId, fg = { value: 50 }, oiPrev = null, maxLev = 5) {
   const [c1h, c4h, c1d, tick, fund, oi, lsr] = await Promise.all([
     apiGet(`/api/v5/market/candles?instId=${instId}&bar=1H&limit=150`),
     apiGet(`/api/v5/market/candles?instId=${instId}&bar=4H&limit=100`),
@@ -793,12 +989,12 @@ async function analyzeMarket(instId) {
   const cd  = c1d.data.map(c=>parseFloat(c[4])).reverse();
   const v1  = c1h.data.map(c=>parseFloat(c[5])).reverse();
 
-  const price = parseFloat(tick.data?.[0]?.last || c1.at(-1));
+  const tickerRow = tick.data?.[0] || null;
+  const price = parseFloat(tickerRow?.last || c1.at(-1));
   const fr    = parseFloat(fund.data?.[0]?.fundingRate||0)*100;
 
   const oiCurrent = oi.data?.[0] ? parseFloat(oi.data[0].oi) : null;
-  const oiPrev    = null;
-  const priceChg24h = tick.data?.[0] ? (parseFloat(tick.data[0].last) - parseFloat(tick.data[0].open24h)) / parseFloat(tick.data[0].open24h) : 0;
+  const priceChg24h = tickerRow ? (parseFloat(tickerRow.last) - parseFloat(tickerRow.open24h)) / parseFloat(tickerRow.open24h) : 0;
 
   const lsrData   = lsr.data?.[0] ? parseFloat(lsr.data[0].longShortRatio) : null;
   const lsrLongPct = lsrData ? lsrData / (1 + lsrData) : null;
@@ -823,6 +1019,9 @@ async function analyzeMarket(instId) {
   const fundLong=fr>0.08, fundShort=fr<-0.05;
   const nearHigh=price>h20*0.98, nearLow=price<l20*1.02;
 
+  // Universal instrument profile (ATR volatility + liquidity normalized)
+  const profile = getInstrumentProfile(c1h.data, tickerRow, price, maxLev);
+
   const c4raw = c4h.data;
   const smc = {
     bullTrap:    detectBullTrap(c4raw, rsi4rolling),
@@ -831,9 +1030,9 @@ async function analyzeMarket(instId) {
     utad:        detectUTAD(c4raw, rsi4rolling),
     stopHunt:    detectStopHunt(c4raw, price),
     absorption:  detectAbsorption(c4raw),
-    fundingTrap: analyzeFundingTrap(fr, price, {value: 50}),
+    fundingTrap: analyzeFundingTrap(fr, price, fg),            // FIX: real F&G
     lsr:         analyzeLSRatio(lsrLongPct),
-    oiDiv:       analyzeOIDivergence(oiCurrent, oiCurrent, priceChg24h),
+    oiDiv:       analyzeOIDivergence(oiCurrent, oiPrev, priceChg24h), // FIX: real oiPrev
   };
 
   return {
@@ -844,6 +1043,7 @@ async function analyzeMarket(instId) {
     trend4h: bullTrend?'BULL':bearTrend?'BEAR':'MIXED',
     smc, oiCurrent, lsrLongPct, priceChg24h,
     rsi4rolling,
+    profile,
   };
 }
 
@@ -1789,6 +1989,10 @@ if (!state.openData)  state.openData = {};
 
 const REENTRY_COOLDOWN_MS = params?.risk?.reentry_cooldown_ms || 4 * 3600 * 1000;
 
+// Telemetry buffers for the structured cycle_snapshot event (schema v1)
+const posSnapshot  = [];
+const scanSnapshot = [];
+
 for (const pos of openPos) {
   const instId    = pos.instId;
   const upl       = parseFloat(pos.upl);
@@ -1829,8 +2033,10 @@ for (const pos of openPos) {
     slLabel += `+MacroTighten`;
   }
 
-  const m   = await analyzeMarket(instId);
+  const oiPrevHold = pickOiPrev(state, instId);
+  const m   = await analyzeMarket(instId, fg, oiPrevHold, params?.risk?.max_leverage_lab || LAB_MAX_LEV);
   if (!m) continue;
+  pushOiSample(state, instId, m.oiCurrent);
   const sig = generateSignal(m, cycle, fg, null, btcTrend, params);
 
   // Log SMC signals for open positions
@@ -1844,14 +2050,49 @@ for (const pos of openPos) {
   if (posSmcLog) console.log(`  SMC: ${posSmcLog}`);
   console.log(`  ${slLabel} | hwm:${(hwm*100).toFixed(1)}% cur:${(pnlPct*100).toFixed(1)}%`);
 
+  // Flat per-position record for cycle_snapshot (schema v1)
+  const odLab = state.openData?.[instId] || {};
+  posSnapshot.push({
+    instId,
+    dir, lever,
+    entry: entryPrice,
+    current: m.price,
+    pnl_pct: pnlPct,
+    upl,
+    hwm,
+    sl_label: slLabel,
+    atr_at_entry: odLab.atrAtEntry || null,
+    atr_pct_at_entry: odLab.atrPctAtEntry || null,
+    atr_pct_now: m.profile?.atrPct || null,
+    session_at_entry: odLab.session || null,
+    entry_score: odLab.score_breakdown?.score_final ?? null,
+    current_score: sig.score,
+    confidence: sig.confidence,
+    funding_rate: m.fr,
+    trail_algo_cl_ord_id: odLab.trailAlgoClOrdId || null,
+    trail_callback_ratio: odLab.trailCallbackRatio || null,
+    trail_active_px: odLab.trailActivePx || null,
+    sl_price: odLab.atrSlPrice || null,
+    tp_price: odLab.atrTpPrice || null,
+  });
+
   const tpPct = params?.entry?.tp_lab || 0.06;
   const tp  = pnlPct >= tpPct;
   const sl  = pnlPct <= slThreshold;
   const rev = (dir==='LONG'&&sig.direction==='short'&&sig.confidence!=='low') ||
               (dir==='SHORT'&&sig.direction==='long'&&sig.confidence!=='low');
+  // FADE exit (lab) — same asymmetric thesis as main
+  const fadeTh = (params?.entry?.fade_exit_threshold != null) ? params.entry.fade_exit_threshold : 0.0;
+  const fade = (dir === 'LONG'  && sig.score <  fadeTh)
+            || (dir === 'SHORT' && sig.score > -fadeTh);
 
-  if (tp||sl||rev) {
-    const reason = tp?`TP+${(tpPct*100).toFixed(0)}%`:sl?`SL[${slLabel}]`:'reversal';
+  if (tp||sl||rev||fade) {
+    let exitReasonType;
+    let reason;
+    if (tp)        { exitReasonType = 'tp';   reason = `TP+${(tpPct*100).toFixed(0)}%`; }
+    else if (sl)   { exitReasonType = 'sl';   reason = `SL[${slLabel}]`; }
+    else if (rev)  { exitReasonType = 'rev';  reason = 'reversal'; }
+    else           { exitReasonType = 'fade'; reason = `fade(score=${sig.score.toFixed(2)})`; }
     console.log(`  → EXIT [${reason}]`);
     const closePosSide = dir === 'LONG' ? 'long' : 'short';
     const closeSide    = dir === 'LONG' ? 'sell' : 'buy';
@@ -1873,7 +2114,7 @@ for (const pos of openPos) {
         const hour = new Date().getUTCHours();
         const session = hour>=0&&hour<8?'asian':hour>=8&&hour<13?'london':'ny';
         appendFileSync(JOURNAL_FILE_NANOCLAW, JSON.stringify({
-          type: 'close', bot: 'lab',
+          type: 'close', schemaVersion: 1, bot: 'lab',
           ts_open: od.ts_open || null,
           ts_close: ts,
           instrument: instId,
@@ -1882,9 +2123,11 @@ for (const pos of openPos) {
           exit: m?.price || null,
           pnl_pct: pnlPct,
           exit_reason: reason,
+          exit_reason_type: exitReasonType, // tp | sl | rev | fade
           session,
           params_version: params.version,
           score: sig.score,
+          fade_threshold: fadeTh,
           primary_signal: (sig.reasons||[])[0] || null,
           signals_fired: sig.reasons || [],
           leverage: lever,
@@ -1916,8 +2159,10 @@ const openIds = openNow.map(p=>p.instId);
 
 if (true) {
   for (const instId of WATCHLIST.filter(id=>!openIds.includes(id))) {
-    const m   = await analyzeMarket(instId);
+    const oiPrevScan = pickOiPrev(state, instId);
+    const m   = await analyzeMarket(instId, fg, oiPrevScan, params?.risk?.max_leverage_lab || LAB_MAX_LEV);
     if (!m) continue;
+    pushOiSample(state, instId, m.oiCurrent);
     const sig = generateSignal(m, cycle, fg, macroR, btcTrend, params);
     const rStr = sig.reasons.slice(0,6).join(' | ');
     // SMC summary display
@@ -1947,6 +2192,55 @@ if (true) {
       conflict_reasons: sig.conflict?.reasons?.join('|')||'',
       conflict_weight: sig.conflict?.totalWeight||0,
       macro: macroR?.event||null });
+
+    // Flat per-scan record for cycle_snapshot (schema v1)
+    scanSnapshot.push({
+      instId,
+      price: m.price,
+      fr: m.fr,
+      rsi_1h: m.r1, rsi_4h: m.r4, rsi_d: m.rd,
+      rsi_div_4h: m.div4, rsi_div_1h: m.div1,
+      macd_hist: m.macd4?.hist ?? null,
+      bb_pct: m.bbp,
+      vol_ratio: m.vr,
+      trend_4h: m.trend4h,
+      bull_trend: m.bullTrend, bear_trend: m.bearTrend,
+      daily_bull: m.dailyBull,
+      near_high: m.nearHigh, near_low: m.nearLow,
+      fund_long: m.fundLong, fund_short: m.fundShort,
+      oi_current: m.oiCurrent,
+      lsr_long_pct: m.lsrLongPct,
+      price_chg_24h: m.priceChg24h,
+      liq_sweep: m.liqSweep,
+      fvg: m.fvg,
+      smc: {
+        wyckoff:      m.smc?.wyckoff?.strength      || null,
+        utad:         m.smc?.utad?.strength          || null,
+        bull_trap:    m.smc?.bullTrap?.strength      || null,
+        bear_trap:    m.smc?.bearTrap?.strength      || null,
+        stop_hunt:    m.smc?.stopHunt?.type          || null,
+        absorption:   m.smc?.absorption?.context     || null,
+        funding_trap: m.smc?.fundingTrap?.type       || null,
+        lsr:          m.smc?.lsr?.label              || null,
+        oi_div:       m.smc?.oiDiv?.label            || null,
+      },
+      profile: m.profile ? {
+        atr: m.profile.atr,
+        atr_pct: m.profile.atrPct,
+        vol_usd: m.profile.volUsd,
+        liquidity_score: m.profile.liquidityScore,
+        size_mult: m.profile.sizeMult,
+        max_lev: m.profile.maxLev,
+      } : null,
+      score: sig.score,
+      score_breakdown: sig.scoreBreakdown || null,
+      direction: sig.direction,
+      confidence: sig.confidence,
+      suggested_leverage: sig.leverage,
+      suggested_size_mult: sig.sizeM,
+      conflict: sig.conflict || null,
+      top_reasons: (sig.reasons || []).slice(0, 8),
+    });
 
     // Ambiguous zone: ask Claude for borderline decisions
     const absScore = Math.abs(sig.score);
@@ -1987,29 +2281,110 @@ if (true) {
       }
       delete state.lastSL[instId];
     }
-    // OKX contract sizes
-    const ctUsdVal = instId.startsWith('BTC') ? 0.01*m.price
-                   : instId.startsWith('ETH') ? 0.1*m.price
-                   : 1*m.price;
-    const minLevNeeded = Math.ceil(ctUsdVal / (equity * 0.8));
-    const labMaxLevParam = params?.risk?.max_leverage_lab || LAB_MAX_LEV;
-    const useLev = Math.min(Math.max(sig.leverage, minLevNeeded), labMaxLevParam);
-    if (useLev !== sig.leverage) {
-      console.log(`  Leverage adjusted: ${sig.leverage}x→${useLev}x (ctUsd=$${ctUsdVal.toFixed(0)}, need min ${minLevNeeded}x)`);
-      await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'long'});
-      await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'short'});
+
+    // ── OKX contract spec (ctVal / minSz / lotSz / maxMktSz) ────────────────
+    // Fetch real spec from exchange. Hardcoded DOGE=1 / XRP=1 was 1000x / 100x
+    // wrong and caused "Market order amount exceeds the maximum" rejects.
+    let spec;
+    try {
+      spec = await getInstrumentSpec(instId);
+    } catch (specErr) {
+      console.log(`  [LAB] [ERROR] ${specErr.message}`);
+      continue;
     }
+    const ctUsdVal = spec.ctVal * m.price;
+
+    // ── Fix #4: Session rules (lab) ────────────────────────────────────────
+    const session = getCurrentSession();
+    const sessionRule = params?.session_rules?.[session] || {};
+    const sessionMaxLev = sessionRule.max_leverage || 999;
+    const sessionSizeMult = sessionRule.size_multiplier || 1.0;
+
+    // ── Universal instrument profile (ATR + liquidity, lab-capped) ─────────
+    const profile = m.profile;
+    const labMaxLevParam = params?.risk?.max_leverage_lab || LAB_MAX_LEV;
+    const maxLevByProfile = profile?.maxLev || labMaxLevParam;
+    const minLevNeeded = Math.ceil(ctUsdVal / (equity * 0.8));
+    const useLev = Math.min(
+      Math.max(sig.leverage, minLevNeeded),
+      labMaxLevParam,
+      maxLevByProfile,
+      sessionMaxLev
+    );
+    if (useLev !== sig.leverage) {
+      console.log(`  [LAB] Leverage: sig=${sig.leverage}x → use=${useLev}x (prof=${maxLevByProfile}x sess=${sessionMaxLev}x)`);
+    }
+
+    // ── ATR-based risk-targeted sizing (universal formula) ──────────────────
     const riskPct = params?.risk?.risk_per_trade_lab || RISK_PER_TRADE;
-    const sz     = Math.max(1, Math.floor(equity*riskPct*useLev*sig.sizeM/ctUsdVal));
-    console.log(`  → ${sig.direction.toUpperCase()} sz=${sz} lev=${useLev}x ~$${(sz*ctUsdVal).toFixed(0)} margin≈$${(sz*ctUsdVal/useLev).toFixed(0)}`);
+    let sz, slPrice, tpPrice;
+    if (profile?.atr && profile?.atrPct) {
+      const riskUsd = equity * riskPct * sessionSizeMult * profile.sizeMult * (sig.sizeM || 1);
+      const slDistance = profile.k_sl * profile.atr;
+      const tpDistance = profile.k_tp * profile.atr;
+      const notionalUsd = riskUsd * (m.price / slDistance);
+      const rawSz = notionalUsd / ctUsdVal;
+      const snapped = snapSizeToSpec(rawSz, spec);
+      sz = snapped.sz;
+      if (snapped.note) console.log(`  [LAB] size snap: ${snapped.note}`);
+      // Guard: min-contract oversize (same as main)
+      const actualNotional = sz * ctUsdVal;
+      if (actualNotional > notionalUsd * 2) {
+        console.log(`  [LAB] [SKIP] Min contract inflates notional ${(actualNotional/notionalUsd).toFixed(1)}× target ($${actualNotional.toFixed(0)} vs $${notionalUsd.toFixed(0)}) — equity too small for ${spec.ctValCcy||instId}`);
+        continue;
+      }
+      slPrice = sig.direction === 'long' ? m.price - slDistance : m.price + slDistance;
+      tpPrice = sig.direction === 'long' ? m.price + tpDistance : m.price - tpDistance;
+      console.log(`  [LAB] ATR=${profile.atr.toFixed(4)} (${(profile.atrPct*100).toFixed(2)}%) sizeMult=${profile.sizeMult.toFixed(2)}`);
+    } else {
+      const rawSz = equity*riskPct*useLev*(sig.sizeM||1)*sessionSizeMult/ctUsdVal;
+      const snapped = snapSizeToSpec(rawSz, spec);
+      sz = snapped.sz;
+      if (snapped.note) console.log(`  [LAB] size snap: ${snapped.note}`);
+      slPrice = null;
+      tpPrice = null;
+    }
+    console.log(`  → ${sig.direction.toUpperCase()} sz=${sz} lev=${useLev}x ~$${(sz*ctUsdVal).toFixed(0)} margin≈$${(sz*ctUsdVal/useLev).toFixed(0)} SL=${formatPx(slPrice)||'?'} TP=${formatPx(tpPrice)||'?'}`);
+
     await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'long'});
     await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'short'});
-    const r = await apiPost('/api/v5/trade/order',{
-      instId, tdMode:'cross', side: sig.direction==='long' ? 'buy' : 'sell',
-      ordType:'market', sz:String(sz), posSide: sig.direction==='long' ? 'long' : 'short'
-    });
+
+    // ── Fix #3: Attach exchange-side SL/TP algo at entry (lab) ─────────────
+    const orderBody = {
+      instId, tdMode:'cross',
+      side: sig.direction==='long' ? 'buy' : 'sell',
+      ordType:'market',
+      sz:String(sz),
+      posSide: sig.direction==='long' ? 'long' : 'short',
+    };
+    let slClOrdId = null;
+    if (slPrice && tpPrice) {
+      slClOrdId = `lab${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 14)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+      orderBody.attachAlgoOrds = [{
+        attachAlgoClOrdId: slClOrdId,
+        slTriggerPx: formatPx(slPrice),
+        slOrdPx: '-1',
+        slTriggerPxType: 'last',
+        tpTriggerPx: formatPx(tpPrice),
+        tpOrdPx: '-1',
+        tpTriggerPxType: 'last',
+      }];
+    }
+    const r = await apiPost('/api/v5/trade/order', orderBody);
     if (r?.code==='0') {
       const e = sig.direction==='long'?'LONG':'SHORT';
+
+      // ── Place OKX native trailing stop (lab) ─────────────────────────────
+      let trailInfo = null;
+      if (profile?.atr && profile?.atrPct) {
+        try {
+          trailInfo = await placeTrailingStop(instId, sig.direction, m.price, profile.atr, profile.atrPct, sz);
+          console.log(`  [LAB] TrailStop: callback=${(trailInfo.callbackRatio*100).toFixed(2)}% activePx=${formatPx(trailInfo.activePx)}`);
+        } catch (trailErr) {
+          console.log(`  [LAB] [WARN] TrailStop failed: ${trailErr.message}`);
+        }
+      }
+
       const smcActive = [
         m.smc?.wyckoff     && `Spring(${m.smc.wyckoff.strength})`,
         m.smc?.utad        && `UTAD(${m.smc.utad.strength})`,
@@ -2022,21 +2397,39 @@ if (true) {
       // Journal: record new entry
       journalWrite({ type:'open', instId, dir: sig.direction.toUpperCase(),
         price: m.price, sz, lev: useLev, score: sig.score, confidence: sig.confidence,
-        fg: fg.value, trend4h: m.trend4h, smc: smcActive||'none' });
+        fg: fg.value, trend4h: m.trend4h, smc: smcActive||'none',
+        slPrice, tpPrice, session,
+        trailCallback: trailInfo?.callbackRatio || null,
+        trailActivePx: trailInfo?.activePx || null });
       try {
         appendFileSync(JOURNAL_FILE_NANOCLAW, JSON.stringify({
           type: 'open', bot: 'lab', instId, dir: sig.direction.toUpperCase(),
           price: m.price, sz, lev: useLev, score: sig.score,
-          confidence: sig.confidence, fg: fg.value, ts: ts
+          confidence: sig.confidence, fg: fg.value, ts: ts,
+          slPrice, tpPrice, session,
+          trailCallback: trailInfo?.callbackRatio || null,
+          trailActivePx: trailInfo?.activePx || null
         }) + '\n');
       } catch {}
-      await tg(`*[LAB] OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
+      const labTrailStr = trailInfo
+        ? `Trail:${(trailInfo.callbackRatio*100).toFixed(1)}%@${formatPx(trailInfo.activePx)}`
+        : 'Trail:none';
+      await tg(`*[LAB] OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nSL:$${formatPx(slPrice)||'-'} TP:$${formatPx(tpPrice)||'-'} | ${labTrailStr}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)} | Sess:${session}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
       if (!state.openData) state.openData = {};
       state.openData[instId] = {
         ts_open: ts, entry: m.price, leverage: useLev, confidence: sig.confidence,
         btc_bias: btcTrend?.bias || null, fear_greed: fg.value, funding_rate: m?.fr || null,
         claude_reasoning: state.openData?.[instId]?.claude_reasoning || null,
-        score_breakdown: sig.scoreBreakdown || null
+        score_breakdown: sig.scoreBreakdown || null,
+        atrSlPrice: slPrice,
+        atrTpPrice: tpPrice,
+        slAlgoClOrdId: slClOrdId,
+        trailAlgoClOrdId: trailInfo?.clId || null,
+        trailCallbackRatio: trailInfo?.callbackRatio || null,
+        trailActivePx: trailInfo?.activePx || null,
+        atrAtEntry: profile?.atr || null,
+        atrPctAtEntry: profile?.atrPct || null,
+        session,
       };
       openNow.push({instId});
     } else {
@@ -2052,5 +2445,46 @@ await sanityCheck(params, state);
 
 state.log.push({ts, equity, fg: fg.value, openPos: openNow.length});
 if (state.log.length > 500) state.log = state.log.slice(-500);
+
+// ══════════════════════════════════════════════════════════════════════════
+// STRUCTURED CYCLE TELEMETRY (schemaVersion 1) — lab bot
+// ══════════════════════════════════════════════════════════════════════════
+// Same schema as main; see okx-trader.js for the full event contract.
+try {
+  const cycleSnapshot = {
+    type: 'cycle_snapshot',
+    schemaVersion: 1,
+    ts,
+    bot: 'lab',
+    params_version: params.version,
+    account: {
+      equity,
+      peak_equity: state.peakEquity,
+      dd: (state.peakEquity - equity) / state.peakEquity,
+      open_positions: openNow.length,
+      consecutive_sl: state.consecutiveSlCount || 0,
+    },
+    context: {
+      fg: fg.value,
+      fg_label: fg.label,
+      fg_trend: fg.trend,
+      btc_bias: btcTrend?.bias ?? null,
+      btc_label: btcTrend?.label ?? null,
+      btc_price: btcTrend?.price ?? null,
+      cycle_phase: cycle.phase,
+      months_from_ath: parseFloat(cycle.monthsFromATH),
+      session: getCurrentSession(),
+      macro_action: macroR?.action || null,
+      macro_event: macroR?.event || null,
+    },
+    scan: scanSnapshot,
+    positions: posSnapshot,
+    alerts: [], // lab doesn't aggregate cycle alerts yet
+  };
+  appendFileSync(JOURNAL_FILE_NANOCLAW, JSON.stringify(cycleSnapshot) + '\n');
+} catch (snapErr) {
+  console.error('cycle_snapshot write failed:', snapErr.message);
+}
+
 saveState(state);
 console.log(`\n${'═'.repeat(65)}`);

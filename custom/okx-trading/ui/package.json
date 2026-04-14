@@ -1,0 +1,14 @@
+{
+  "name": "okx-monitor-ui",
+  "version": "1.0.0",
+  "description": "Local web dashboard for the OKX trading bot — reads journal.jsonl and streams live updates via SSE.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

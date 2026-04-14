@@ -123,9 +123,155 @@ async function getFearGreed() {
 // ── State ─────────────────────────────────────────────────────────────────────
 function loadState() {
   try { if (existsSync(STATE_FILE)) return JSON.parse(readFileSync(STATE_FILE, 'utf-8')); } catch {}
-  return { peakEquity: 100, trades: [], log: [], lastTrade: {}, trailPeak: {}, lastSL: {} };
+  return { peakEquity: 100, trades: [], log: [], lastTrade: {}, trailPeak: {}, lastSL: {}, oiHistory: {} };
 }
 function saveState(s) { try { writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch {} }
+
+// ── OI history cache (for real OI divergence analysis) ───────────────────────
+// We sample OI per instrument each cycle and pick a ~2–8h-old sample as the
+// "previous" reference point. OKX has no public historical OI-per-instrument
+// endpoint, so we roll our own cache in the state file.
+function pushOiSample(state, instId, oiValue) {
+  if (!oiValue || !isFinite(oiValue)) return;
+  if (!state.oiHistory) state.oiHistory = {};
+  const rec = state.oiHistory[instId] || { samples: [] };
+  rec.samples = (rec.samples || []).filter(s => s && s.ts && s.oi);
+  rec.samples.push({ ts: new Date().toISOString(), oi: oiValue });
+  // keep last 24 samples (~12h at 30-min cadence)
+  if (rec.samples.length > 24) rec.samples = rec.samples.slice(-24);
+  state.oiHistory[instId] = rec;
+}
+function pickOiPrev(state, instId) {
+  const rec = state.oiHistory?.[instId];
+  if (!rec?.samples?.length) return null;
+  const now = Date.now();
+  // Prefer the oldest sample still inside the [2h, 8h] window
+  const candidates = rec.samples.filter(s => {
+    const age = now - new Date(s.ts).getTime();
+    return age >= 2 * 3600 * 1000 && age <= 8 * 3600 * 1000;
+  });
+  if (candidates.length) return candidates[0].oi;
+  // Fallback: the oldest available sample if at least 1h old
+  const oldest = rec.samples[0];
+  const oldestAge = now - new Date(oldest.ts).getTime();
+  return oldestAge >= 3600 * 1000 ? oldest.oi : null;
+}
+
+// [removed] syncExchangeSl — superseded by ensureProfitLockSl (below).
+// Amend-algos against an attached conditional (from attachAlgoOrds) was
+// not reliably modifying the SL in practice: OKX reported code 0 but the
+// SL trigger on the attached algo stayed at its original value, so the
+// hold-loop kept "thinking" it was syncing while nothing actually changed.
+// ensureProfitLockSl uses a SEPARATE standalone conditional algo for the
+// profit lock, leaving the attached hard SL/TP untouched as a floor.
+
+// ── OKX native trailing stop (move_order_stop) ───────────────────────────────
+// Runs server-side at tick speed so profit-locking trails between cron cycles.
+// `callbackRatio` = how much retracement from HWM triggers the close (as a
+// decimal — "0.015" = 1.5%).
+// `activePx` = price that must be reached before the trail starts tracking;
+// prevents activation on initial noise right after entry.
+async function placeTrailingStop(instId, direction, entryPrice, atr, atrPct, sz) {
+  if (!atr || !atrPct || !sz) throw new Error('missing atr/sz');
+  const isLong = direction === 'long' || direction === 'LONG';
+  const posSide  = isLong ? 'long' : 'short';
+  const closeSide = isLong ? 'sell' : 'buy';
+  // Callback: 0.8 × natural 1H ATR%, minimum 0.6% (avoid impossibly tight trails)
+  const callbackRatio = Math.max(0.006, 0.8 * atrPct);
+  // Activation price: half an ATR in favor from entry. Trail dormant until then.
+  const activePx = isLong
+    ? entryPrice + 0.5 * atr
+    : entryPrice - 0.5 * atr;
+  const clId = `ts${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+  const body = {
+    instId, tdMode: 'cross',
+    side: closeSide, posSide,
+    ordType: 'move_order_stop',
+    sz: String(sz),
+    callbackRatio: callbackRatio.toFixed(4),
+    activePx: formatPx(activePx),
+    reduceOnly: 'true',
+    algoClOrdId: clId,
+  };
+  const r = await apiPost('/api/v5/trade/order-algo', body)
+    .catch(e => ({ code: 'err', err: e.message }));
+  if (r?.code === '0') return { clId, callbackRatio, activePx };
+  throw new Error(`trailing stop failed: ${r?.data?.[0]?.sMsg || r?.err || JSON.stringify(r).slice(0, 120)}`);
+}
+
+// ── Profit lock SL (standalone conditional algo, separate from hard SL) ──
+// The original attached SL from entry (via attachAlgoOrds) is the hard floor
+// that protects against liquidation; we intentionally never touch it because
+// amend-algos on an attached algo is unreliable. Instead, once the position
+// is meaningfully in profit we place a SEPARATE standalone conditional SL
+// that acts as a "profit lock" and progressively tightens through tiers
+// (breakeven → +5% → +10% → trailing 70% of HWM).
+//
+// Semantics for the user: on the OKX algo panel they will see
+//   attached TPYSL  (2340.84 / 2418.12)   ← floor from entry, never changes
+//   DCDL trailing   (move_order_stop)     ← tick-level continuous trail
+//   pl… TPYSL       (2392.00 / –)         ← profit lock, updated per tier
+// Whichever fires first closes the position; others auto-cancel when pos=0.
+async function ensureProfitLockSl(instId, dir, newLockPrice, openDataEntry) {
+  const triggerPx = formatPx(newLockPrice);
+  if (!triggerPx) throw new Error('invalid profit lock trigger px');
+  const posSide = (dir === 'LONG' || dir === 'long') ? 'long' : 'short';
+  const closeSide = posSide === 'long' ? 'sell' : 'buy';
+  const existingClId = openDataEntry?.profitLockClOrdId || null;
+  const prevLockPrice = openDataEntry?.profitLockLevelPrice || null;
+
+  // Skip if the price barely moved (avoid thrashing the exchange on noise)
+  if (existingClId && prevLockPrice &&
+      Math.abs(newLockPrice - prevLockPrice) / prevLockPrice < 0.0005) {
+    return { mode: 'noop' };
+  }
+
+  // Try amend first (atomic — no momentary gap in protection)
+  if (existingClId) {
+    const amend = await apiPost('/api/v5/trade/amend-algos', [{
+      instId,
+      algoClOrdId: existingClId,
+      newSlTriggerPx: triggerPx,
+      newSlOrdPx: '-1',
+    }]).catch(e => ({ code: 'err', err: e.message }));
+    if (amend?.code === '0') {
+      openDataEntry.profitLockLevelPrice = newLockPrice;
+      return { mode: 'amend', clId: existingClId };
+    }
+    // Amend failed — cancel the stale one before re-posting
+    await apiPost('/api/v5/trade/cancel-algos', [{
+      instId, algoClOrdId: existingClId,
+    }]).catch(() => null);
+    openDataEntry.profitLockClOrdId = null;
+  }
+
+  // Need actual position size for reduceOnly
+  const posResp = await apiGet(`/api/v5/account/positions?instId=${instId}`)
+    .catch(() => null);
+  const live = (posResp?.data || []).find(p =>
+    p.posSide === posSide && Math.abs(parseFloat(p.pos)) > 0);
+  const sz = live ? Math.abs(parseFloat(live.pos)) : null;
+  if (!sz) throw new Error('no open position for profit lock');
+
+  const newClId = `pl${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+  const post = await apiPost('/api/v5/trade/order-algo', {
+    instId, tdMode: 'cross',
+    side: closeSide, posSide,
+    ordType: 'conditional',
+    sz: String(sz),
+    slTriggerPx: triggerPx,
+    slOrdPx: '-1',
+    slTriggerPxType: 'last',
+    algoClOrdId: newClId,
+    reduceOnly: 'true',
+  });
+  if (post?.code !== '0') {
+    throw new Error(`profit lock post failed: ${post?.data?.[0]?.sMsg || JSON.stringify(post).slice(0, 120)}`);
+  }
+  openDataEntry.profitLockClOrdId = newClId;
+  openDataEntry.profitLockLevelPrice = newLockPrice;
+  return { mode: 'created', clId: newClId };
+}
 
 // ── Macro Check ───────────────────────────────────────────────────────────────
 function getMacroRestriction() {
@@ -226,6 +372,180 @@ function rsiDiv(closes, n=14, lb=20) {
   if (Math.min(...ps.slice(h))<Math.min(...ps.slice(0,h))*0.998 && Math.min(...rs.slice(h))>Math.min(...rs.slice(0,h))*1.02) return 'bullish';
   if (Math.max(...ps.slice(h))>Math.max(...ps.slice(0,h))*1.002 && Math.max(...rs.slice(h))<Math.max(...rs.slice(0,h))*0.98) return 'bearish';
   return 'none';
+}
+
+// ── ATR (Average True Range) ──────────────────────────────────────────────────
+// Input: raw OKX candles (newest-first) in format [ts, o, h, l, c, vol, volCcy, ...]
+// Output: ATR over `n` bars in underlying price units
+function atr(rawCandles, n = 14) {
+  if (!rawCandles || rawCandles.length < n + 1) return null;
+  const c = rawCandles.slice(0, n + 1).reverse(); // chronological
+  let sum = 0;
+  for (let i = 1; i < c.length; i++) {
+    const high = parseFloat(c[i][2]);
+    const low  = parseFloat(c[i][3]);
+    const prev = parseFloat(c[i - 1][4]);
+    const tr = Math.max(high - low, Math.abs(high - prev), Math.abs(low - prev));
+    sum += tr;
+  }
+  return sum / (c.length - 1);
+}
+
+// ── Universal instrument profile ──────────────────────────────────────────────
+// Volatility-normalized (ATR) + liquidity-aware scaling.
+// Same formula for every coin — no per-coin tuning needed.
+function getInstrumentProfile(c1hRaw, tickerRow, price, maxLevCap) {
+  const atr1h = atr(c1hRaw, 14);
+  if (!atr1h || !isFinite(atr1h) || !price) return null;
+  const atrPct = atr1h / price;
+  // 24h USD turnover: OKX SWAP `volCcy24h` is in base-ccy (e.g. ETH), multiply by price
+  const volUsd = parseFloat(tickerRow?.volCcy24h || 0) * price;
+  // Liquidity score: log-normalized. $10M → 0.0, $1B → 1.0
+  const liquidityScore = Math.min(1, Math.max(0, (Math.log10(Math.max(volUsd, 1e6)) - 7) / 2));
+  // Size multiplier: illiquid coins get smaller positions (0.4 – 1.0)
+  const sizeMult = 0.4 + 0.6 * liquidityScore;
+  // Volatility-adjusted leverage cap.
+  // Rationale: target ~12% margin heat per 1-ATR underlying move.
+  //   maxLev ≈ 0.12 / atrPct  (e.g. atrPct=2% → 6x, atrPct=4% → 3x)
+  const maxLevFromVol = Math.max(3, Math.round(0.12 / Math.max(atrPct, 0.005)));
+  const maxLev = Math.min(maxLevCap, maxLevFromVol);
+  return {
+    atr: atr1h,
+    atrPct,
+    volUsd,
+    liquidityScore,
+    sizeMult,
+    maxLev,
+    k_sl: 1.5,  // SL distance = 1.5 × ATR from entry
+    k_tp: 3.0,  // TP distance = 3.0 × ATR from entry (1:2 R:R)
+  };
+}
+
+// ── Trading session (UTC) ─────────────────────────────────────────────────────
+function getCurrentSession() {
+  const hour = new Date().getUTCHours();
+  if (hour < 8)  return 'asian';
+  if (hour < 13) return 'london';
+  return 'ny';
+}
+
+// ── Convert trailing-ladder SL (uplRatio scale) to trigger price ─────────────
+// uplRatio = PnL / margin = (price_change / entry) × leverage × sign(direction)
+// So: price_change / entry = slUplRatio / leverage
+function ladderSlToPrice(entryPrice, slUplRatio, leverage, direction) {
+  if (!entryPrice || !leverage) return null;
+  const pctFromEntry = slUplRatio / leverage; // signed
+  const isLong = direction === 'long' || direction === 'LONG';
+  return isLong
+    ? entryPrice * (1 + pctFromEntry)
+    : entryPrice * (1 - pctFromEntry);
+}
+
+// ── OKX price precision helper ────────────────────────────────────────────────
+// OKX accepts plain decimal price strings; use 6 significant digits to stay
+// well inside tick-size tolerance for the watchlist instruments.
+function formatPx(p) {
+  if (p == null || !isFinite(p)) return null;
+  return Number(p).toPrecision(6);
+}
+
+// ── OKX instrument spec cache ─────────────────────────────────────────────────
+// Different OKX SWAPs use very different ctVal:
+//   BTC-USDT-SWAP  = 0.01   BTC   per contract
+//   ETH-USDT-SWAP  = 0.1    ETH   per contract
+//   SOL-USDT-SWAP  = 1      SOL   per contract
+//   SUI-USDT-SWAP  = 1      SUI   per contract
+//   XRP-USDT-SWAP  = 100    XRP   per contract
+//   DOGE-USDT-SWAP = 1000   DOGE  per contract   ← blew up the old sizing code
+// Hardcoding is brittle, so we fetch from /public/instruments lazily and
+// cache in-process (cron process lives a few seconds per cycle anyway).
+const _instSpecCache = new Map();
+async function getInstrumentSpec(instId) {
+  if (_instSpecCache.has(instId)) return _instSpecCache.get(instId);
+  const r = await apiGet(`/api/v5/public/instruments?instType=SWAP&instId=${instId}`)
+    .catch(e => ({ code: 'err', err: e.message }));
+  if (r?.code !== '0' || !r.data?.[0]) {
+    throw new Error(`instrument spec fetch failed for ${instId}: ${r?.err || r?.msg || JSON.stringify(r).slice(0,120)}`);
+  }
+  const d = r.data[0];
+  const spec = {
+    instId: d.instId,
+    ctVal: parseFloat(d.ctVal) || 1,          // underlying units per contract
+    ctValCcy: d.ctValCcy || null,             // e.g. "DOGE"
+    minSz:    parseFloat(d.minSz) || 1,       // minimum contracts per order
+    lotSz:    parseFloat(d.lotSz) || 1,       // contract increment
+    maxMktSz: d.maxMktSz ? parseFloat(d.maxMktSz) : Infinity,  // market order cap
+    tickSz:   parseFloat(d.tickSz) || null,
+  };
+  _instSpecCache.set(instId, spec);
+  return spec;
+}
+
+// Snap a raw contract count to exchange rules (minSz, lotSz, maxMktSz).
+// Returns the final integer size AND a note describing any adjustment for logs.
+function snapSizeToSpec(rawSz, spec) {
+  let sz = Math.max(1, Math.floor(rawSz));
+  let note = '';
+  if (spec.lotSz && spec.lotSz > 0) {
+    sz = Math.floor(sz / spec.lotSz) * spec.lotSz;
+    if (sz <= 0) sz = spec.lotSz;
+  }
+  if (spec.minSz && sz < spec.minSz) {
+    sz = spec.minSz;
+    note += `min→${spec.minSz} `;
+  }
+  if (isFinite(spec.maxMktSz) && sz > spec.maxMktSz) {
+    note += `clamp ${sz}→${spec.maxMktSz}`;
+    sz = spec.maxMktSz;
+  }
+  return { sz, note: note.trim() };
+}
+
+// ── Display / report formatting helpers ─────────────────────────────────────
+function fmtMoney(n) {
+  if (n == null || !isFinite(n)) return '?';
+  const a = Math.abs(n);
+  if (a >= 1000) return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  if (a >= 10)   return '$' + n.toFixed(2);
+  if (a >= 1)    return '$' + n.toFixed(3);
+  if (a >= 0.01) return '$' + n.toFixed(4);
+  return '$' + Number(n).toPrecision(4);
+}
+function fmtDelta(n) {
+  if (n == null || !isFinite(n)) return '';
+  const s = n >= 0 ? '▲' : '▼';
+  return s + '$' + Math.abs(n).toFixed(2);
+}
+function fmtPct(n, digits = 1) {
+  if (n == null || !isFinite(n)) return '?';
+  return (n >= 0 ? '+' : '') + (n * 100).toFixed(digits) + '%';
+}
+function fmtDuration(ms) {
+  if (!ms || ms < 0) return '?';
+  const sec = Math.floor(ms / 1000);
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return `${d}d${h}h`;
+  if (h > 0) return `${h}h${m}m`;
+  return `${m}m`;
+}
+function htmlEscape(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+function sessionShort(sess) {
+  return sess === 'asian' ? 'Asia' : sess === 'london' ? 'Lon' : sess === 'ny' ? 'NY' : '?';
+}
+function fgBadge(v) {
+  if (v == null) return '';
+  if (v <= 10) return '☢☢';
+  if (v <= 25) return '☢';
+  if (v >= 90) return '🔥🔥';
+  if (v >= 75) return '🔥';
+  return '';
 }
 
 function detectLiqSweep(c4h, lookback=10) {
@@ -795,7 +1115,10 @@ function analyzeOIDivergence(oiCurrent, oiPrev, priceChange) {
 // ════════════════════════════════════════════════════════════════════════════
 
 // ── Full Market Analysis ──────────────────────────────────────────────────────
-async function analyzeMarket(instId) {
+// fg:      current Fear&Greed object (for FR-trap fusion)
+// oiPrev:  previous OI sample from state cache (for OI divergence)
+// maxLev:  hard leverage cap (from params) for instrument profile
+async function analyzeMarket(instId, fg = { value: 50 }, oiPrev = null, maxLev = 12) {
   const [c1h, c4h, c1d, tick, fund, oi, lsr] = await Promise.all([
     apiGet(`/api/v5/market/candles?instId=${instId}&bar=1H&limit=150`),
     apiGet(`/api/v5/market/candles?instId=${instId}&bar=4H&limit=100`),
@@ -812,13 +1135,13 @@ async function analyzeMarket(instId) {
   const cd  = c1d.data.map(c=>parseFloat(c[4])).reverse();
   const v1  = c1h.data.map(c=>parseFloat(c[5])).reverse();
 
-  const price = parseFloat(tick.data?.[0]?.last || c1.at(-1));
+  const tickerRow = tick.data?.[0] || null;
+  const price = parseFloat(tickerRow?.last || c1.at(-1));
   const fr    = parseFloat(fund.data?.[0]?.fundingRate||0)*100;
 
-  // OI data (for divergence analysis)
+  // OI data — oiPrev now supplied by caller from state cache (real divergence)
   const oiCurrent = oi.data?.[0] ? parseFloat(oi.data[0].oi) : null;
-  const oiPrev    = null; // would need historical OI — use ticker 24h change as proxy
-  const priceChg24h = tick.data?.[0] ? (parseFloat(tick.data[0].last) - parseFloat(tick.data[0].open24h)) / parseFloat(tick.data[0].open24h) : 0;
+  const priceChg24h = tickerRow ? (parseFloat(tickerRow.last) - parseFloat(tickerRow.open24h)) / parseFloat(tickerRow.open24h) : 0;
 
   // Long/Short ratio
   const lsrData   = lsr.data?.[0] ? parseFloat(lsr.data[0].longShortRatio) : null;
@@ -846,6 +1169,9 @@ async function analyzeMarket(instId) {
   const fundLong=fr>0.08, fundShort=fr<-0.05;
   const nearHigh=price>h20*0.98, nearLow=price<l20*1.02;
 
+  // ── Universal instrument profile (ATR volatility + liquidity normalized) ──
+  const profile = getInstrumentProfile(c1h.data, tickerRow, price, maxLev);
+
   // ── Smart Money Signals ────────────────────────────────────────────────────
   // Pass raw OHLCV candle arrays (newest first from OKX)
   const c4raw = c4h.data;  // OKX returns newest first
@@ -856,9 +1182,9 @@ async function analyzeMarket(instId) {
     utad:        detectUTAD(c4raw, rsi4rolling),
     stopHunt:    detectStopHunt(c4raw, price),
     absorption:  detectAbsorption(c4raw),
-    fundingTrap: analyzeFundingTrap(fr, price, {value: 50}), // fg injected later in signal
+    fundingTrap: analyzeFundingTrap(fr, price, fg),            // FIX: real F&G
     lsr:         analyzeLSRatio(lsrLongPct),
-    oiDiv:       analyzeOIDivergence(oiCurrent, oiCurrent, priceChg24h), // simplified
+    oiDiv:       analyzeOIDivergence(oiCurrent, oiPrev, priceChg24h), // FIX: real oiPrev
   };
 
   return {
@@ -869,6 +1195,7 @@ async function analyzeMarket(instId) {
     trend4h: bullTrend?'BULL':bearTrend?'BEAR':'MIXED',
     smc, oiCurrent, lsrLongPct, priceChg24h,
     rsi4rolling,
+    profile, // ATR, sizeMult, maxLev, k_sl, k_tp, liquidityScore, volUsd, atrPct
   };
 }
 
@@ -1604,6 +1931,25 @@ async function tgTo(chatId, msg) {
   });
 }
 
+// ── Telegram HTML sender ─────────────────────────────────────────────────────
+// Uses parse_mode=HTML which lets us use <blockquote expandable> for the
+// collapsible section of the periodic monitor report.
+async function tgHtml(msg) {
+  const botToken = '7986090023:AAFhg8IaukAMN5WGlyvCKgSlsYAcbdDiEP4';
+  const chatId   = '1275624537';
+  const body = JSON.stringify({
+    chat_id: chatId,
+    text: msg,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+  });
+  return new Promise(resolve => {
+    const req = https.request({hostname:'api.telegram.org',path:`/bot${botToken}/sendMessage`,method:'POST',
+      headers:{'Content-Type':'application/json'}}, res => { res.on('data',()=>{}); res.on('end',resolve); });
+    req.on('error', ()=>resolve()); req.write(body); req.end();
+  });
+}
+
 function formatParamsMsg(params) {
   const r = params.risk || {}, e = params.entry || {}, ev = params.evolve || {};
   const topW = Object.entries(params.signal_weights || {}).sort((a,b)=>Math.abs(b[1])-Math.abs(a[1])).slice(0,5)
@@ -1754,13 +2100,28 @@ console.log(`Open: ${openPos.length}/${maxPos}\n`);
 
 // ── Manage positions ──────────────────────────────────────────────────────────
 // Ensure adaptive state fields exist (backward-compat with old state files)
-if (!state.trailPeak) state.trailPeak = {};
-if (!state.lastSL)    state.lastSL = {};
-if (!state.openData)  state.openData = {};
+if (!state.trailPeak)  state.trailPeak = {};
+if (!state.lastSL)     state.lastSL = {};
+if (!state.openData)   state.openData = {};
+if (!state.oiHistory)  state.oiHistory = {};
+if (!state.lastScores) state.lastScores = {};
+if (state.consecutiveSlCount == null) state.consecutiveSlCount = 0;
+const prevEquity = typeof state.lastEquity === 'number' ? state.lastEquity : null;
 
 const REENTRY_COOLDOWN_MS = params?.risk?.reentry_cooldown_ms || 4 * 3600 * 1000;
 
-const posInfo = {}; // track trailing state per position for report
+// Cycle-level alert queue for the monitor report
+// Each: { level: 'critical'|'warning'|'info', icon, text }
+const cycleAlerts = [];
+const posInfo = {}; // track trailing + monitor fields per position for report
+
+// ── Telemetry buffers for the structured cycle_snapshot event ───────────────
+// See the "STRUCTURED CYCLE TELEMETRY" block at the end of main for schema.
+// These are appended to by the hold-loop and scan-loop below, then serialized
+// as one JSONL record per cycle so downstream UI / analytics tools can
+// reconstruct what the bot saw and decided, indicator-by-indicator.
+const posSnapshot  = [];
+const scanSnapshot = [];
 for (const pos of openPos) {
   const instId    = pos.instId;
   const upl       = parseFloat(pos.upl);
@@ -1778,13 +2139,17 @@ for (const pos of openPos) {
   // ── Tiered SL threshold (tightens as position profits) — uses params ─────
   const tsl = params?.trailing_sl_main || {};
   let slThreshold, slLabel;
+  // ATR-based initial SL override — if we stored one at entry, use it at t0
+  // so the initial stop scales with the coin's natural volatility (universal).
+  const od0 = state.openData?.[instId] || {};
+  const atrT0Sl = typeof od0.atrSlUplRatio === 'number' ? od0.atrSlUplRatio : null;
   // Tiered SL — thresholds in position-margin % (pos.uplRatio scale)
   // t5: hwm≥30% → trail at 70% of hwm
   // t4: hwm≥20% → HARD LOCK at +10%
   // t3: hwm≥15% → HARD LOCK at +5%
   // t2: hwm≥10% → break-even
   // t1: hwm≥5%  → tighten SL to -3%
-  // t0: default  → initial SL -7%
+  // t0: default  → ATR-scaled initial SL (or fallback -7%)
   if (hwm >= (tsl.t5_hwm || 0.30)) {
     slThreshold = hwm * (tsl.t5_pct || 0.70);
     slLabel = `Trail${((tsl.t5_pct||0.70)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%→SL:${(slThreshold*100).toFixed(0)}%)`;
@@ -1800,6 +2165,9 @@ for (const pos of openPos) {
   } else if (hwm >= (tsl.t1_hwm || 0.05)) {
     slThreshold = tsl.t1_sl || -0.03;
     slLabel = `Tight${((tsl.t1_sl||-0.03)*100).toFixed(0)}%(hwm:${(hwm*100).toFixed(0)}%)`;
+  } else if (atrT0Sl != null) {
+    slThreshold = atrT0Sl;
+    slLabel = `ATR-SL${(atrT0Sl*100).toFixed(0)}%`;
   } else {
     slThreshold = tsl.t0_sl || -0.07;
     slLabel = `SL${((tsl.t0_sl||-0.07)*100).toFixed(0)}%`;
@@ -1812,9 +2180,44 @@ for (const pos of openPos) {
     slLabel += `+MacroTighten`;
   }
 
-  const m   = await analyzeMarket(instId);
+  // Resolve oiPrev from state cache (2–8h old sample preferred)
+  const oiPrevHold = pickOiPrev(state, instId);
+  const m   = await analyzeMarket(instId, fg, oiPrevHold, params?.risk?.max_leverage_main || 12);
   if (!m) continue;
+  // Update OI history cache for next cycle
+  pushOiSample(state, instId, m.oiCurrent);
   const sig = generateSignal(m, cycle, fg, null, btcTrend, params);
+
+  // ── Profit-lock SL (standalone algo, kicks in at hwm ≥ t1 threshold) ─
+  // Only touch this once position is actually in profit territory. The
+  // original hard SL from entry (2392 + 1.5·ATR zone) and the OKX trailing
+  // stop are independent — we never modify those. This adds a third
+  // explicit "profit lock" conditional that's visible in the OKX algo
+  // panel with clear semantics for the user.
+  const newLockPrice = ladderSlToPrice(entryPrice, slThreshold, lever, dir);
+  const prevLockPrice = state.openData?.[instId]?.profitLockLevelPrice || null;
+  let profitLockStatus = null;
+  // Only place/update the profit lock if the effective lock is ≥ 0 on the
+  // margin side (i.e. at least breakeven — don't duplicate the hard SL at
+  // a loss level). slThreshold ≥ 0 corresponds to tiers t2..t5.
+  if (newLockPrice && slThreshold >= 0 && hwm >= (tsl.t2_hwm || 0.10)) {
+    if (!prevLockPrice || Math.abs(newLockPrice - prevLockPrice) / entryPrice > 0.001) {
+      try {
+        if (!state.openData[instId]) state.openData[instId] = {};
+        const res = await ensureProfitLockSl(instId, dir, newLockPrice, state.openData[instId]);
+        profitLockStatus = res.mode;
+        console.log(`  ProfitLock ${res.mode} → ${formatPx(newLockPrice)} (${slLabel})`);
+      } catch (e) {
+        console.log(`  [WARN] ProfitLock failed: ${e.message}`);
+        cycleAlerts.push({
+          level: 'warning', icon: '⚠️',
+          text: `Profit-lock SL failed: <b>${htmlEscape(instId.split('-')[0])}</b> ${htmlEscape(e.message.slice(0,60))}`,
+        });
+      }
+    }
+  }
+  const exchangeSlOk = state.openData?.[instId]?.profitLockClOrdId != null
+    || state.openData?.[instId]?.slAlgoClOrdId != null;
 
   // Log SMC signals for open positions (trap warnings critical)
   const posSmcLog = [
@@ -1825,7 +2228,114 @@ for (const pos of openPos) {
     m.smc?.stopHunt  && `StopHunt:${m.smc.stopHunt.type.includes('bull')?'up':'down'}`,
   ].filter(Boolean).join(' ');
   if (posSmcLog) console.log(`  SMC: ${posSmcLog}`);
-  posInfo[instId] = { hwm, slLabel, pnlPct };
+
+  // ── Build rich posInfo for the monitor report ──────────────────────────
+  const od = state.openData?.[instId] || {};
+  const tsOpenMs = od.ts_open ? new Date(od.ts_open).getTime() : null;
+  const ageMs = tsOpenMs ? (Date.now() - tsOpenMs) : null;
+  // SL in absolute price: prefer profit lock (tightest), else ATR hard SL
+  const slPriceAbs = od.profitLockLevelPrice || od.atrSlPrice || newLockPrice;
+  // Distance from current price to SL, as % of current price (signed: always +)
+  let distToSlPct = null;
+  if (slPriceAbs && m.price) {
+    distToSlPct = Math.abs(m.price - slPriceAbs) / m.price;
+  }
+  const entryScoreVal = od.entryScore != null ? od.entryScore
+                       : (od.score_breakdown?.score_final != null ? od.score_breakdown.score_final : null);
+  const curScore = sig.score;
+  // Funding context
+  const frAbs = Math.abs(m.fr || 0);
+  const riskUsdAtEntry = od.riskUsdAtEntry || null;
+
+  posInfo[instId] = {
+    hwm, slLabel, pnlPct,
+    dir, lever,
+    entry: entryPrice,
+    current: m.price,
+    ageMs,
+    slPrice: slPriceAbs,
+    distToSlPct,
+    exchangeSlOk,
+    atrPctEntry: od.atrPctAtEntry || null,
+    atrPctNow: m.profile?.atrPct || null,
+    session: od.session || null,
+    entryScore: entryScoreVal,
+    curScore,
+    fr: m.fr,
+    riskUsdAtEntry,
+    smcTags: posSmcLog || '',
+  };
+
+  // Track current score history for next cycle's delta comparison
+  if (!state.openData[instId]) state.openData[instId] = {};
+  state.openData[instId].lastScore = curScore;
+
+  // ── Flat per-position record for the cycle_snapshot event ──────────────
+  posSnapshot.push({
+    instId,
+    dir, lever,
+    entry: entryPrice,
+    current: m.price,
+    pnl_pct: pnlPct,
+    upl,
+    age_ms: ageMs,
+    hwm,
+    sl_price: slPriceAbs,
+    sl_label: slLabel,
+    dist_to_sl_pct: distToSlPct,
+    exchange_sl_ok: exchangeSlOk,
+    atr_at_entry: od.atrAtEntry || null,
+    atr_pct_at_entry: od.atrPctAtEntry || null,
+    atr_pct_now: m.profile?.atrPct || null,
+    session_at_entry: od.session || null,
+    entry_score: entryScoreVal,
+    current_score: curScore,
+    confidence: sig.confidence,
+    funding_rate: m.fr,
+    risk_usd_at_entry: riskUsdAtEntry,
+    smc_tags: posSmcLog || null,
+    trail_algo_cl_ord_id: od.trailAlgoClOrdId || null,
+    trail_callback_ratio: od.trailCallbackRatio || null,
+    trail_active_px: od.trailActivePx || null,
+  });
+
+  // ── Per-position alert detection ────────────────────────────────────────
+  const sym = instId.split('-')[0];
+  // Close to SL (critical < 0.5%, warning < 1.2%)
+  if (distToSlPct != null && distToSlPct < 0.005 && pnlPct < 0) {
+    cycleAlerts.push({
+      level: 'critical', icon: '🚨',
+      text: `<b>${sym}</b> only ${(distToSlPct*100).toFixed(2)}% from SL @ ${formatPx(slPriceAbs)}`,
+    });
+  } else if (distToSlPct != null && distToSlPct < 0.012 && pnlPct < 0) {
+    cycleAlerts.push({
+      level: 'warning', icon: '⚠️',
+      text: `<b>${sym}</b> ${(distToSlPct*100).toFixed(1)}% from SL @ ${formatPx(slPriceAbs)}`,
+    });
+  }
+  // Score flip / fade: entry side same as dir, now flipped or near-zero
+  if (entryScoreVal != null && curScore != null) {
+    const sameSide = (dir === 'LONG' && curScore > 0) || (dir === 'SHORT' && curScore < 0);
+    const fadedBy = Math.abs(entryScoreVal) - Math.abs(curScore);
+    if (!sameSide && Math.abs(entryScoreVal) >= 0.4) {
+      cycleAlerts.push({
+        level: 'warning', icon: '🔄',
+        text: `<b>${sym}</b> score flipped: ${entryScoreVal.toFixed(2)} → ${curScore.toFixed(2)} (${dir} weakening)`,
+      });
+    } else if (fadedBy >= 0.4) {
+      cycleAlerts.push({
+        level: 'warning', icon: '📉',
+        text: `<b>${sym}</b> score fading: ${entryScoreVal.toFixed(2)} → ${curScore.toFixed(2)}`,
+      });
+    }
+  }
+  // Funding spike (|fr| > 0.12%) — taker cost getting heavy
+  if (frAbs > 0.12) {
+    cycleAlerts.push({
+      level: 'warning', icon: '💸',
+      text: `<b>${sym}</b> funding spike: ${m.fr.toFixed(3)}%`,
+    });
+  }
   console.log(`  ${slLabel} | hwm:${(hwm*100).toFixed(1)}% cur:${(pnlPct*100).toFixed(1)}%`);
 
   const tpPct = params?.entry?.tp_main || 0.40; // 40% cap (RSI TP triggers earlier)
@@ -1836,9 +2346,23 @@ for (const pos of openPos) {
   const sl  = pnlPct <= slThreshold;
   const rev = (dir==='LONG'&&sig.direction==='short'&&sig.confidence!=='low') ||
               (dir==='SHORT'&&sig.direction==='long'&&sig.confidence!=='low');
+  // ── FADE exit: score crosses neutrality vs our direction ────────────────
+  // Entry needs |score| ≥ 0.75 (high conviction); exit only needs score to
+  // cross fade_exit_threshold (default 0.0 = neutrality). The asymmetry
+  // yields hysteresis — 0.75-wide gap prevents whipsaw, and the SL-only
+  // 4h reentry cooldown still applies to losing exits.
+  const fadeTh = (params?.entry?.fade_exit_threshold != null) ? params.entry.fade_exit_threshold : 0.0;
+  const fade = (dir === 'LONG'  && sig.score <  fadeTh)
+            || (dir === 'SHORT' && sig.score > -fadeTh);
 
-  if (tp||sl||rev) {
-    const reason = (pnlPct>=tpPct)?`TP+${(tpPct*100).toFixed(0)}%`:rsiTp?`RSI-TP(${m.r4?.toFixed(0)}%)`:sl?`SL[${slLabel}]`:'reversal';
+  if (tp||sl||rev||fade) {
+    let exitReasonType;
+    let reason;
+    if (pnlPct>=tpPct)     { exitReasonType = 'tp';      reason = `TP+${(tpPct*100).toFixed(0)}%`; }
+    else if (rsiTp)        { exitReasonType = 'rsi_tp';  reason = `RSI-TP(${m.r4?.toFixed(0)}%)`; }
+    else if (sl)           { exitReasonType = 'sl';      reason = `SL[${slLabel}]`; }
+    else if (rev)          { exitReasonType = 'rev';     reason = 'reversal'; }
+    else /* fade */        { exitReasonType = 'fade';    reason = `fade(score=${sig.score.toFixed(2)})`; }
     console.log(`  → EXIT [${reason}]`);
     const closePosSide = pos.posSide || (dir === 'LONG' ? 'long' : 'short');
     const closeSide    = dir === 'LONG' ? 'sell' : 'buy';
@@ -1847,8 +2371,14 @@ for (const pos of openPos) {
       ordType:'market', sz:String(Math.abs(parseFloat(pos.pos))), posSide: closePosSide
     });
     if (r?.code==='0') {
-      // Record SL hit for re-entry cooldown
-      if (sl) state.lastSL[instId] = { ts, pnlPct, entryPrice, hwm };
+      // Record SL hit for re-entry cooldown + consecutive-SL counter
+      if (sl) {
+        state.lastSL[instId] = { ts, pnlPct, entryPrice, hwm };
+        state.consecutiveSlCount = (state.consecutiveSlCount || 0) + 1;
+      } else if (pnlPct > 0) {
+        // Winning close → reset the counter
+        state.consecutiveSlCount = 0;
+      }
       // Clean trailing state for this position
       delete state.trailPeak[instId];
       // Performance tracking
@@ -1861,7 +2391,7 @@ for (const pos of openPos) {
         const hour = new Date().getUTCHours();
         const session = hour>=0&&hour<8?'asian':hour>=8&&hour<13?'london':'ny';
         appendFileSync(JOURNAL_FILE_NANOCLAW, JSON.stringify({
-          type: 'close', bot: 'main',
+          type: 'close', schemaVersion: 1, bot: 'main',
           ts_open: od.ts_open || null,
           ts_close: ts,
           instrument: instId,
@@ -1870,9 +2400,12 @@ for (const pos of openPos) {
           exit: m?.price || null,
           pnl_pct: pnlPct,
           exit_reason: reason,
+          exit_reason_type: exitReasonType, // tp | rsi_tp | sl | rev | fade
           session,
           params_version: params.version,
           score: sig.score,
+          entry_score: od.entryScore != null ? od.entryScore : null,
+          fade_threshold: fadeTh,
           primary_signal: (sig.reasons||[])[0] || null,
           signals_fired: sig.reasons || [],
           leverage: lever,
@@ -1907,8 +2440,10 @@ const scanSummary = [];
 if (!FAST_MODE) {
 if (true) {
   for (const instId of WATCHLIST.filter(id=>!openIds.includes(id))) {
-    const m   = await analyzeMarket(instId);
+    const oiPrevScan = pickOiPrev(state, instId);
+    const m   = await analyzeMarket(instId, fg, oiPrevScan, params?.risk?.max_leverage_main || 12);
     if (!m) continue;
+    pushOiSample(state, instId, m.oiCurrent);
     const sig = generateSignal(m, cycle, fg, macroR, btcTrend, params);
     const rStr = sig.reasons.slice(0,6).join(' | ');
     // SMC summary display
@@ -1928,6 +2463,63 @@ if (true) {
     if (sbStr) console.log(`       [breakdown] ${sbStr}`);
     if (smcLog) console.log(`       SMC: ${smcLog}`);
     scanSummary.push({id:instId.split('-')[0],dir:sig.direction,score:sig.score,conf:sig.confidence});
+
+    // ── Flat per-scan record for the cycle_snapshot event (schema v1) ──────
+    // Captures every indicator value + the final decision for each instrument
+    // so a downstream UI / notebook can reconstruct the bot's view.
+    scanSnapshot.push({
+      instId,
+      price: m.price,
+      fr: m.fr,
+      // Trend / momentum
+      rsi_1h: m.r1, rsi_4h: m.r4, rsi_d: m.rd,
+      rsi_div_4h: m.div4, rsi_div_1h: m.div1,
+      macd_hist: m.macd4?.hist ?? null,
+      macd_prev_hist: m.macd4?.prevHist ?? null,
+      bb_upper: m.bb?.upper ?? null, bb_mid: m.bb?.mid ?? null, bb_lower: m.bb?.lower ?? null,
+      bb_pct: m.bbp,
+      vol_ratio: m.vr,
+      trend_4h: m.trend4h,
+      bull_trend: m.bullTrend, bear_trend: m.bearTrend,
+      daily_bull: m.dailyBull,
+      near_high: m.nearHigh, near_low: m.nearLow,
+      fund_long: m.fundLong, fund_short: m.fundShort,
+      // Microstructure
+      oi_current: m.oiCurrent,
+      lsr_long_pct: m.lsrLongPct,
+      price_chg_24h: m.priceChg24h,
+      liq_sweep: m.liqSweep,
+      fvg: m.fvg,
+      // SMC (structured)
+      smc: {
+        wyckoff:      m.smc?.wyckoff?.strength      || null,
+        utad:         m.smc?.utad?.strength          || null,
+        bull_trap:    m.smc?.bullTrap?.strength      || null,
+        bear_trap:    m.smc?.bearTrap?.strength      || null,
+        stop_hunt:    m.smc?.stopHunt?.type          || null,
+        absorption:   m.smc?.absorption?.context     || null,
+        funding_trap: m.smc?.fundingTrap?.type       || null,
+        lsr:          m.smc?.lsr?.label              || null,
+        oi_div:       m.smc?.oiDiv?.label            || null,
+      },
+      // Profile (ATR + liquidity)
+      profile: m.profile ? {
+        atr: m.profile.atr,
+        atr_pct: m.profile.atrPct,
+        vol_usd: m.profile.volUsd,
+        liquidity_score: m.profile.liquidityScore,
+        size_mult: m.profile.sizeMult,
+        max_lev: m.profile.maxLev,
+      } : null,
+      // Decision
+      score: sig.score,
+      score_breakdown: sig.scoreBreakdown || null,
+      direction: sig.direction,
+      confidence: sig.confidence,
+      suggested_leverage: sig.leverage,
+      suggested_size_mult: sig.sizeM,
+      top_reasons: (sig.reasons || []).slice(0, 8),
+    });
     if (!sig.direction || sig.confidence==='low' || sig.confidence==='none') {
       // Check ambiguous zone: ask Claude for a second opinion
       const absScore = Math.abs(sig.score);
@@ -1970,31 +2562,126 @@ if (true) {
       // Cooldown expired — clear it
       delete state.lastSL[instId];
     }
-    // OKX contract sizes: BTC=0.01BTC/ct, ETH=0.1ETH/ct, SOL=1SOL/ct
-    const ctUsdVal = instId.startsWith('BTC') ? 0.01*m.price
-                   : instId.startsWith('ETH') ? 0.1*m.price
-                   : 1*m.price;
-    // Use min leverage that allows at least 1 contract; cap at sig.leverage
-    const minLevNeeded = Math.ceil(ctUsdVal / (equity * 0.8));
-    const maxLevParam  = params?.risk?.max_leverage_main || 12;
-    const useLev = Math.min(Math.max(sig.leverage, minLevNeeded), maxLevParam);
-    if (useLev !== sig.leverage) {
-      console.log(`  Leverage adjusted: ${sig.leverage}x→${useLev}x (ctUsd=$${ctUsdVal.toFixed(0)}, need min ${minLevNeeded}x)`);
-      await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'long'});
-      await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'short'});
+
+    // ── OKX contract spec (real ctVal / minSz / lotSz / maxMktSz per coin) ─
+    // Fetched from /public/instruments rather than hardcoded.
+    // Hardcoded table was wrong for DOGE (1000) and XRP (100), blowing up sizing.
+    let spec;
+    try {
+      spec = await getInstrumentSpec(instId);
+    } catch (specErr) {
+      console.log(`  [ERROR] ${specErr.message}`);
+      continue;
     }
+    const ctUsdVal = spec.ctVal * m.price;
+
+    // ── Fix #4: Session rules (max_leverage + size_multiplier) ─────────────
+    const session = getCurrentSession();
+    const sessionRule = params?.session_rules?.[session] || {};
+    const sessionMaxLev = sessionRule.max_leverage || 999;
+    const sessionSizeMult = sessionRule.size_multiplier || 1.0;
+
+    // ── Universal instrument profile (ATR + liquidity) ──────────────────────
+    const profile = m.profile;
+    const maxLevParam  = params?.risk?.max_leverage_main || 12;
+    const maxLevByProfile = profile?.maxLev || maxLevParam;
+    const minLevNeeded = Math.ceil(ctUsdVal / (equity * 0.8));
+    const useLev = Math.min(
+      Math.max(sig.leverage, minLevNeeded),
+      maxLevParam,
+      maxLevByProfile,
+      sessionMaxLev
+    );
+    if (useLev !== sig.leverage) {
+      console.log(`  Leverage: sig=${sig.leverage}x → use=${useLev}x (prof=${maxLevByProfile}x sess=${sessionMaxLev}x minNeeded=${minLevNeeded}x)`);
+    }
+
+    // ── ATR-based risk-targeted sizing (Fix #6 + universal formula) ─────────
     const riskPct = params?.risk?.risk_per_trade_main || RISK_PER_TRADE;
-    const sz     = Math.max(1, Math.floor(equity*riskPct*useLev*sig.sizeM/ctUsdVal));
-    console.log(`  → ${sig.direction.toUpperCase()} sz=${sz} lev=${useLev}x ~$${(sz*ctUsdVal).toFixed(0)} margin≈$${(sz*ctUsdVal/useLev).toFixed(0)}`);
-    // Must set leverage for both sides in long_short_mode
+    let sz, slPrice, tpPrice, riskUsdApplied = null;
+    if (profile?.atr && profile?.atrPct) {
+      // risk USD = equity × risk% × session × liquidity × signal strength
+      const riskUsd = equity * riskPct * sessionSizeMult * profile.sizeMult * (sig.sizeM || 1);
+      riskUsdApplied = riskUsd;
+      const slDistance = profile.k_sl * profile.atr;
+      const tpDistance = profile.k_tp * profile.atr;
+      // Notional sized so that a slDistance move against us costs exactly riskUsd
+      const notionalUsd = riskUsd * (m.price / slDistance);
+      const rawSz = notionalUsd / ctUsdVal;
+      const snapped = snapSizeToSpec(rawSz, spec);
+      sz = snapped.sz;
+      if (snapped.note) console.log(`  size snap: ${snapped.note}`);
+      // Guard: if exchange min-contract forces notional way above the target
+      // (small equity on large-ctVal coins like DOGE/XRP), skip entirely
+      // rather than take unexpected oversized risk.
+      const actualNotional = sz * ctUsdVal;
+      if (actualNotional > notionalUsd * 2) {
+        console.log(`  [SKIP] Min contract inflates notional ${(actualNotional/notionalUsd).toFixed(1)}× target ($${actualNotional.toFixed(0)} vs $${notionalUsd.toFixed(0)}) — equity too small for ${spec.ctValCcy||instId}`);
+        continue;
+      }
+      slPrice = sig.direction === 'long' ? m.price - slDistance : m.price + slDistance;
+      tpPrice = sig.direction === 'long' ? m.price + tpDistance : m.price - tpDistance;
+      console.log(`  ATR=${profile.atr.toFixed(4)} (${(profile.atrPct*100).toFixed(2)}%) sizeMult=${profile.sizeMult.toFixed(2)} liq=$${(profile.volUsd/1e6).toFixed(0)}M`);
+    } else {
+      // Fallback: legacy margin-% sizing if profile unavailable
+      const rawSz = equity*riskPct*useLev*(sig.sizeM||1)*sessionSizeMult/ctUsdVal;
+      const snapped = snapSizeToSpec(rawSz, spec);
+      sz = snapped.sz;
+      if (snapped.note) console.log(`  size snap: ${snapped.note}`);
+      slPrice = null;
+      tpPrice = null;
+      console.log(`  [WARN] No ATR profile — legacy sizing`);
+    }
+    console.log(`  → ${sig.direction.toUpperCase()} sz=${sz} lev=${useLev}x ~$${(sz*ctUsdVal).toFixed(0)} margin≈$${(sz*ctUsdVal/useLev).toFixed(0)} SL=${formatPx(slPrice)||'?'} TP=${formatPx(tpPrice)||'?'}`);
+
+    // Set leverage on both sides (hedge mode requires it)
     await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'long'});
     await apiPost('/api/v5/account/set-leverage',{instId,lever:String(useLev),mgnMode:'cross',posSide:'short'});
-    const r = await apiPost('/api/v5/trade/order',{
-      instId, tdMode:'cross', side: sig.direction==='long' ? 'buy' : 'sell',
-      ordType:'market', sz:String(sz), posSide: sig.direction==='long' ? 'long' : 'short'
-    });
+
+    // ── Fix #3: Attach exchange-side SL/TP algo to the market entry ─────────
+    const orderBody = {
+      instId, tdMode:'cross',
+      side: sig.direction==='long' ? 'buy' : 'sell',
+      ordType:'market',
+      sz:String(sz),
+      posSide: sig.direction==='long' ? 'long' : 'short',
+    };
+    let slClOrdId = null;
+    if (slPrice && tpPrice) {
+      slClOrdId = `sl${instId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)}${Date.now().toString().slice(-10)}`.slice(0, 32);
+      orderBody.attachAlgoOrds = [{
+        attachAlgoClOrdId: slClOrdId,
+        slTriggerPx: formatPx(slPrice),
+        slOrdPx: '-1',
+        slTriggerPxType: 'last',
+        tpTriggerPx: formatPx(tpPrice),
+        tpOrdPx: '-1',
+        tpTriggerPxType: 'last',
+      }];
+    }
+    const r = await apiPost('/api/v5/trade/order', orderBody);
     if (r?.code==='0') {
       const e = sig.direction==='long'?'LONG':'SHORT';
+      // Signed initial SL in uplRatio scale (negative = loss) for t0 override
+      const atrSlUplRatio = slPrice
+        ? -Math.abs((m.price - slPrice) / m.price) * useLev
+        : null;
+
+      // ── Place OKX native trailing stop (runs server-side at tick speed) ──
+      let trailInfo = null;
+      if (profile?.atr && profile?.atrPct) {
+        try {
+          trailInfo = await placeTrailingStop(instId, sig.direction, m.price, profile.atr, profile.atrPct, sz);
+          console.log(`  TrailStop: callback=${(trailInfo.callbackRatio*100).toFixed(2)}% activePx=${formatPx(trailInfo.activePx)}`);
+        } catch (trailErr) {
+          console.log(`  [WARN] TrailStop failed: ${trailErr.message}`);
+          cycleAlerts.push({
+            level: 'warning', icon: '⚠️',
+            text: `<b>${htmlEscape(instId.split('-')[0])}</b> trailing stop failed: ${htmlEscape(String(trailErr.message).slice(0, 60))}`,
+          });
+        }
+      }
+
       // Highlight smart money signals in notification
       const smcActive = [
         m.smc?.wyckoff     && `Spring(${m.smc.wyckoff.strength})`,
@@ -2005,13 +2692,30 @@ if (true) {
         m.smc?.absorption  && `Absorb:${m.smc.absorption.context}`,
         m.lsrLongPct       && `LSR:${(m.lsrLongPct*100).toFixed(0)}%L`,
       ].filter(Boolean).join(' ');
-      await tg(`*OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
+      const trailStr = trailInfo
+        ? `Trail:${(trailInfo.callbackRatio*100).toFixed(1)}%@${formatPx(trailInfo.activePx)}`
+        : 'Trail:none';
+      await tg(`*OPEN ${e}* ${instId}\nLev:${useLev}x | ${sz}ct | Entry:$${m.price.toFixed(2)}\nSL:$${formatPx(slPrice)||'-'} TP:$${formatPx(tpPrice)||'-'} | ${trailStr}\nConf:${sig.confidence} | Score:${sig.score.toFixed(2)} | Sess:${session}\nFG:${fg.value}(${fg.label})\nSMC: ${smcActive||'none'}\n${sig.reasons.slice(0,5).join(', ')}\nEquity:$${equity.toFixed(2)}`);
       if (!state.openData) state.openData = {};
       state.openData[instId] = {
         ts_open: ts, entry: m.price, leverage: useLev, confidence: sig.confidence,
         btc_bias: btcTrend?.bias || null, fear_greed: fg.value, funding_rate: m?.fr || null,
         claude_reasoning: state.openData?.[instId]?.claude_reasoning || null,
-        score_breakdown: sig.scoreBreakdown || null
+        score_breakdown: sig.scoreBreakdown || null,
+        atrSlPrice: slPrice,                      // hard floor SL (attachAlgoOrds)
+        atrTpPrice: tpPrice,                      // hard TP ceiling
+        atrSlUplRatio,                            // signed, for t0 tier override
+        slAlgoClOrdId: slClOrdId,                 // attached hard SL client id
+        profitLockClOrdId: null,                  // set by ensureProfitLockSl when hwm ≥ t2
+        profitLockLevelPrice: null,               // current profit lock level (tier ladder)
+        trailAlgoClOrdId: trailInfo?.clId || null,
+        trailCallbackRatio: trailInfo?.callbackRatio || null,
+        trailActivePx: trailInfo?.activePx || null,
+        atrAtEntry: profile?.atr || null,
+        atrPctAtEntry: profile?.atrPct || null,
+        session,
+        entryScore: sig.score,                    // for report entry→current delta
+        riskUsdAtEntry: riskUsdApplied,           // for risk summary in report
       };
       openNow.push({instId});
     } else {
@@ -2030,26 +2734,270 @@ await sanityCheck(params, state);
 
 state.log.push({ts, equity, fg: fg.value, openPos: openNow.length});
 if (state.log.length > 500) state.log = state.log.slice(-500);
+
+// ── Cycle-level alerts that depend on aggregate state ─────────────────────
+const ddFrac = (state.peakEquity - equity) / state.peakEquity;
+if (ddFrac >= 0.15) {
+  cycleAlerts.push({ level: 'critical', icon: '📉',
+    text: `<b>Drawdown ${(ddFrac*100).toFixed(1)}%</b> — ≥15% circuit breaker, bot will pause next cycle` });
+} else if (ddFrac >= 0.10) {
+  cycleAlerts.push({ level: 'warning', icon: '📉',
+    text: `Drawdown <b>${(ddFrac*100).toFixed(1)}%</b> — approaching 15% pause threshold` });
+}
+if ((state.consecutiveSlCount || 0) >= 3) {
+  cycleAlerts.push({ level: 'critical', icon: '🔴',
+    text: `<b>${state.consecutiveSlCount}x consecutive SL</b> — sanity check may disable evolve` });
+}
+
+// ── Evolve delta alert: compare params.version vs last reported ───────────
+const evolveBumped = state.reportLastParamsVersion != null && state.reportLastParamsVersion !== params.version;
+if (evolveBumped) {
+  cycleAlerts.push({ level: 'info', icon: '🧬',
+    text: `Evolve applied: v${state.reportLastParamsVersion} → v${params.version} (${htmlEscape(params.update_reason || '?')})` });
+}
+
 if (!FAST_MODE) {
-// compact report (no AI)
-const _NL = String.fromCharCode(10);
-const _holds = openNow.map(function(p){
-  var sym=p.instId.split('-')[0];
-  var pnlR=parseFloat(p.uplRatio),upl=parseFloat(p.upl),pct=(pnlR||0)*100;
-  var dir=p.posSide==='short'?'S':p.posSide==='long'?'L':parseFloat(p.pos)>0?'L':'S',lev=parseFloat(p.lever);
-  var info=posInfo&&posInfo[p.instId];
-  var trailStr=info?(' [hwm:'+(info.hwm*100).toFixed(0)+'% '+info.slLabel+']'):'';
-  return sym+' '+dir+lev+'x '+(pct>=0?'+':'')+pct.toFixed(1)+'%'+trailStr;
-}).join(_NL);
-const _scans = scanSummary.filter(function(x){return x.dir||Math.abs(x.score)>=0.5;}).map(function(x){
-  return (x.conf==='medium'||x.conf==='high'?'':'~')+x.id+':'+(x.dir?x.dir.toUpperCase():'wait');
-}).join(' | ');
-const _dd=((state.peakEquity-equity)/state.peakEquity*100).toFixed(1);
-const _btc=(btcTrend&&btcTrend.bias)?btcTrend.bias:'?';
-const _rep='*OKX* $'+equity.toFixed(2)+'  DD:'+_dd+'% | FG:'+fg.value+' BTC:'+_btc
-  +(_holds?_NL+_holds:'')
-  +(_scans?_NL+'Scan: '+_scans:'');
-await tg(_rep);
+  // ── buildCompactReport: HTML with expandable blockquote ─────────────────
+  const eq   = equity;
+  const dEq  = prevEquity != null ? (eq - prevEquity) : null;
+  const ddPct = ddFrac * 100;
+  const session = getCurrentSession();
+  const sessLabel = sessionShort(session);
+  const fgBadgeStr = fgBadge(fg.value);
+  const btcArrow = (btcTrend && btcTrend.bias > 0.05) ? '↑'
+                 : (btcTrend && btcTrend.bias < -0.05) ? '↓' : '→';
+  const maxPos = params?.risk?.max_positions_main || 4;
+  // Aggregate risk USD at risk (sum of stored per-position risk budgets)
+  let totalRiskUsd = 0;
+  let riskUsdKnown = false;
+  for (const p of openNow) {
+    const r = state.openData?.[p.instId]?.riskUsdAtEntry;
+    if (typeof r === 'number') { totalRiskUsd += r; riskUsdKnown = true; }
+  }
+  const riskFragment = riskUsdKnown
+    ? `$${totalRiskUsd.toFixed(2)}@risk (${(totalRiskUsd / eq * 100).toFixed(1)}%)`
+    : 'risk:?';
+
+  // Macro context: find nearest upcoming event
+  let macroStr = '';
+  try {
+    const today = Date.now();
+    const upcoming = MACRO_CAL
+      .map(ev => ({ ...ev, dt: new Date(ev.date).getTime() }))
+      .filter(ev => ev.dt >= today - 86400000)
+      .sort((a, b) => a.dt - b.dt)[0];
+    if (upcoming) {
+      const days = Math.max(0, Math.round((upcoming.dt - today) / 86400000));
+      macroStr = `${days === 0 ? 'today' : days + 'd'}: ${upcoming.event}`;
+    }
+  } catch {}
+
+  // Evolve ETA
+  const evolveInt = params?.evolve?.interval_ms || 21600000;
+  const lastEv = params?.evolve?.last_evolved_at ? new Date(params.evolve.last_evolved_at).getTime() : null;
+  const evolveEtaMs = lastEv ? Math.max(0, lastEv + evolveInt - Date.now()) : null;
+  const evolveEtaStr = evolveEtaMs != null ? fmtDuration(evolveEtaMs) : '?';
+
+  // ── Headline (always visible) ────────────────────────────────────────────
+  const headlineLines = [];
+  const delta = dEq != null ? ' ' + fmtDelta(dEq) : '';
+  headlineLines.push(
+    `<b>OKX v${params.version}</b> ${fmtMoney(eq)}${delta} DD:${ddPct.toFixed(1)}% | ` +
+    `FG:${fg.value}${fgBadgeStr} BTC${btcArrow} | ${openNow.length}/${maxPos} ${sessLabel}`
+  );
+  headlineLines.push(`<i>${riskFragment} · evolve:${evolveEtaStr}${macroStr ? ' · ' + htmlEscape(macroStr) : ''}</i>`);
+
+  // ── Critical alerts outside the blockquote (always visible) ─────────────
+  const criticalAlerts = cycleAlerts.filter(a => a.level === 'critical');
+  if (criticalAlerts.length) {
+    headlineLines.push(''); // spacer
+    for (const a of criticalAlerts) headlineLines.push(`${a.icon} ${a.text}`);
+  }
+
+  // ── Expandable block with full detail ────────────────────────────────────
+  const detailLines = [];
+
+  // Positions section
+  if (openNow.length > 0) {
+    detailLines.push('📊 <b>POSITIONS</b>');
+    for (const p of openNow) {
+      const info = posInfo[p.instId];
+      if (!info) {
+        // Legacy position without new posInfo (shouldn't happen post-fix)
+        const sym = htmlEscape(p.instId.split('-')[0]);
+        const pct = (parseFloat(p.uplRatio) || 0) * 100;
+        detailLines.push(`  <b>${sym}</b> — legacy, no metadata (${pct.toFixed(1)}%)`);
+        continue;
+      }
+      const sym = htmlEscape(p.instId.split('-')[0]);
+      const dirShort = info.dir === 'LONG' ? 'L' : 'S';
+      const ageStr = info.ageMs != null ? fmtDuration(info.ageMs) : '?';
+      const pnlPctStr = ((info.pnlPct || 0) * 100).toFixed(1);
+      const pnlSign = info.pnlPct >= 0 ? '+' : '';
+      const entryStr = info.entry ? fmtMoney(info.entry) : '?';
+      const curStr = info.current ? fmtMoney(info.current) : '?';
+      detailLines.push(
+        `  <b>${sym}</b> ${dirShort}${info.lever}x · ${ageStr} · ${entryStr}→${curStr} (<b>${pnlSign}${pnlPctStr}%</b>)`
+      );
+      // SL line
+      const slStr = info.slPrice ? fmtMoney(info.slPrice) : '?';
+      const distStr = info.distToSlPct != null ? `${(info.distToSlPct*100).toFixed(2)}% away` : '?';
+      const exchTag = info.exchangeSlOk ? '🔒exch' : '⚠local-only';
+      const atrStr = info.atrPctNow != null ? `ATR:${(info.atrPctNow*100).toFixed(2)}%` : '';
+      detailLines.push(
+        `    SL:${slStr} ${exchTag} · ${distStr}${atrStr ? ' · ' + atrStr : ''}`
+      );
+      // Score trend
+      if (info.entryScore != null && info.curScore != null) {
+        const dScore = info.curScore - info.entryScore;
+        const trendIcon = (info.dir === 'LONG' && dScore < -0.2) || (info.dir === 'SHORT' && dScore > 0.2)
+                          ? '⚠fade' : '✓hold';
+        detailLines.push(
+          `    score ${info.entryScore.toFixed(2)}→${info.curScore.toFixed(2)} ${trendIcon} · ${info.slLabel}`
+        );
+      } else {
+        detailLines.push(`    ${info.slLabel}`);
+      }
+      if (info.smcTags) detailLines.push(`    SMC: ${htmlEscape(info.smcTags)}`);
+      if (info.fr != null && Math.abs(info.fr) > 0.02) {
+        detailLines.push(`    funding: ${info.fr.toFixed(3)}%`);
+      }
+    }
+  } else {
+    detailLines.push('📊 <b>POSITIONS</b> — none');
+  }
+
+  // Non-critical alerts
+  const nonCritical = cycleAlerts.filter(a => a.level !== 'critical');
+  if (nonCritical.length) {
+    detailLines.push('');
+    detailLines.push('⚠️ <b>ALERTS</b>');
+    for (const a of nonCritical) detailLines.push(`  ${a.icon} ${a.text}`);
+  }
+
+  // Scan section (signals forming on non-open instruments)
+  if (scanSummary && scanSummary.length) {
+    detailLines.push('');
+    detailLines.push('📡 <b>SCAN</b>');
+    const scanLines = scanSummary
+      .slice()
+      .sort((a, b) => Math.abs(b.score || 0) - Math.abs(a.score || 0))
+      .map(x => {
+        const mark = (x.conf === 'medium' || x.conf === 'high') ? '' : '~';
+        const arrow = x.dir === 'long' ? '↑' : x.dir === 'short' ? '↓' : '·';
+        return `  ${mark}${htmlEscape(x.id)}: ${arrow}${x.dir ? x.dir.toUpperCase() : 'wait'} (${(x.score || 0).toFixed(2)})`;
+      });
+    for (const l of scanLines) detailLines.push(l);
+  }
+
+  // Context block
+  detailLines.push('');
+  detailLines.push('📰 <b>CONTEXT</b>');
+  detailLines.push(`  Session: ${sessLabel} (${new Date().toISOString().slice(11,16)} UTC)`);
+  if (btcTrend?.price) detailLines.push(`  BTC: ${fmtMoney(btcTrend.price)} ${htmlEscape(btcTrend.label || '')}`);
+  detailLines.push(`  F&amp;G: ${fg.value} (${htmlEscape(fg.label || '')}) trend:${htmlEscape(fg.trend || '')}`);
+  detailLines.push(`  Cycle: ${htmlEscape(cycle.phase || '')} · ${cycle.monthsFromATH}mo from ATH`);
+  if (macroStr) detailLines.push(`  Next macro: ${htmlEscape(macroStr)}`);
+  detailLines.push(`  Evolve: next in ${evolveEtaStr} (params v${params.version})`);
+  detailLines.push(`  ConsecSL: ${state.consecutiveSlCount || 0}  ·  Equity peak: ${fmtMoney(state.peakEquity)}`);
+
+  // Assemble final HTML
+  const headline = headlineLines.join('\n');
+  const detail   = detailLines.join('\n');
+  const repHtml  = `${headline}\n<blockquote expandable>${detail}</blockquote>`;
+
+  // ── Report throttling (Step B: 5-min cron but ~30-min report cadence) ────
+  // With cron running every 5 minutes we don't want to spam Telegram. Only
+  // send the full compact report when one of these is true:
+  //   1. ≥ 25 min since last full report (baseline ~30-min cadence)
+  //   2. A critical alert fired this cycle
+  //   3. Self-evolve bumped params.version since last cycle
+  //   4. Position count changed (open/close) — though open/close already
+  //      sends its own tg() notification, this also refreshes the dashboard
+  const FULL_REPORT_INTERVAL_MS = 25 * 60 * 1000;
+  const lastFullReportTs = state.lastFullReportTs || 0;
+  const timeSinceFullReport = Date.now() - lastFullReportTs;
+  const hasCritical = cycleAlerts.some(a => a.level === 'critical');
+  const prevPosCount = typeof state.lastPosCount === 'number' ? state.lastPosCount : -1;
+  const curPosCount = openNow.length;
+  const posChanged = prevPosCount !== -1 && prevPosCount !== curPosCount;
+  const shouldSendFull =
+    timeSinceFullReport >= FULL_REPORT_INTERVAL_MS ||
+    hasCritical ||
+    evolveBumped ||
+    posChanged;
+
+  if (shouldSendFull) {
+    await tgHtml(repHtml);
+    state.lastFullReportTs = Date.now();
+  } else {
+    const nextInMs = FULL_REPORT_INTERVAL_MS - timeSinceFullReport;
+    console.log(`[REPORT] Throttled — next full report in ${fmtDuration(nextInMs)} (no critical / no pos change)`);
+  }
+  state.lastPosCount = curPosCount;
 } // end !FAST_MODE compact report
+
+// ══════════════════════════════════════════════════════════════════════════
+// STRUCTURED CYCLE TELEMETRY (schemaVersion 1)
+// ══════════════════════════════════════════════════════════════════════════
+// One flat record per cycle, appended to journal.jsonl. Enables a downstream
+// UI / notebook / dashboard to reconstruct everything the bot saw + decided
+// at this point in time. Intentionally wide + flat (not nested) so it maps
+// cleanly to SQL / pandas DataFrames / DuckDB queries.
+//
+// Event schema:
+//   type:             "cycle_snapshot"
+//   schemaVersion:    1
+//   ts:               ISO8601
+//   bot:              "main" | "lab"
+//   params_version:   integer
+//   account:          { equity, peak_equity, dd, open_positions, consec_sl }
+//   context:          { fg, fg_label, fg_trend, btc_bias, btc_label,
+//                       cycle_phase, months_from_ath, session, macro_* }
+//   scan:             [ ...scanSnapshot ]        — one per non-open instrument
+//   positions:        [ ...posSnapshot ]         — one per open position
+//   alerts:           [ { level, text } ]        — cycle_alerts raised
+//
+// Consumers should branch on `type` and tolerate missing fields gracefully
+// when schemaVersion advances.
+try {
+  const cycleSnapshot = {
+    type: 'cycle_snapshot',
+    schemaVersion: 1,
+    ts,
+    bot: 'main',
+    params_version: params.version,
+    account: {
+      equity,
+      peak_equity: state.peakEquity,
+      dd: (state.peakEquity - equity) / state.peakEquity,
+      open_positions: openNow.length,
+      consecutive_sl: state.consecutiveSlCount || 0,
+    },
+    context: {
+      fg: fg.value,
+      fg_label: fg.label,
+      fg_trend: fg.trend,
+      btc_bias: btcTrend?.bias ?? null,
+      btc_label: btcTrend?.label ?? null,
+      btc_price: btcTrend?.price ?? null,
+      cycle_phase: cycle.phase,
+      months_from_ath: parseFloat(cycle.monthsFromATH),
+      session: getCurrentSession(),
+      macro_action: macroR?.action || null,
+      macro_event: macroR?.event || null,
+    },
+    scan: scanSnapshot,
+    positions: posSnapshot,
+    alerts: cycleAlerts.map(a => ({ level: a.level, text: a.text })),
+  };
+  appendFileSync(JOURNAL_FILE_NANOCLAW, JSON.stringify(cycleSnapshot) + '\n');
+} catch (snapErr) {
+  console.error('cycle_snapshot write failed:', snapErr.message);
+}
+
+// Persist report-tracking fields for next cycle
+state.lastEquity = equity;
+state.reportLastParamsVersion = params.version;
 saveState(state);
 console.log(`\n${'═'.repeat(65)}`);
